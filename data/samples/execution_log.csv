@@ -1,0 +1,3 @@
+execution_id,recommendation_id,sportsbook,opened_at,live_detected_at,bet_placed_at,actual_market,actual_line,actual_american_odds,stake,accepted_odds_movement,was_within_window,latency_seconds,status,notes
+exec_x01,rec_x01,FanDuel,2026-07-01 12:58,2026-07-01 13:01:02,2026-07-01 13:01:09,ML_3WAY,,-140,280,true,true,,placed,7s from live to placed; odds moved -135 to -140
+exec_x02,rec_x02,bet365,2026-07-02 10:33,2026-07-02 10:35:01,,,,,,false,false,,missed,odds fell below +140 before slip confirmed

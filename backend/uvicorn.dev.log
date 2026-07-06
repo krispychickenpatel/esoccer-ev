@@ -1,0 +1,15 @@
+INFO:     Started server process [63520]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:58456 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58466 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58467 - "GET /api/friend-picks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58468 - "GET /api/friend-picks/report HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58469 - "GET /api/paper-trades HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58470 - "GET /api/paper-trades/report HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58471 - "GET /api/profit/gates HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58472 - "GET /api/provider/bookmaker-coverage HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58473 - "GET /api/provider/feed-comparison HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58518 - "GET /api/lab/verify-integrity HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58528 - "GET /api/health HTTP/1.1" 200 OK

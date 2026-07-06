@@ -1,0 +1,4 @@
+bet_id,date_time_placed,sportsbook,sport,league,market,selection,opponent,line,american_odds,decimal_odds,stake,result,payout,profit,closing_american_odds,notes,screenshot_file
+b_0001,2026-07-01 13:01,FanDuel,ESoccer,Esoccer Battle - 8 mins,ML_3WAY,Arsenal (CRUSADER),Spurs (ALIBI),,-140,1.7143,280,win,480.00,200.00,-150,placed at first live tick,slips/b_0001.png
+b_0002,2026-07-01 13:01,FanDuel,ESoccer,Esoccer Battle - 8 mins,SPREAD_2WAY,Arsenal (CRUSADER),Spurs (ALIBI),-0.5,-135,1.7407,270,win,470.00,200.00,,either-or leg,slips/b_0002.png
+b_0003,2026-07-02 10:35,bet365,ESoccer,GT League,ML_3WAY,Aston Villa (PROPHET),Spurs (ALIBI),,160,2.60,100,loss,0,-100,140,line drifted after live,

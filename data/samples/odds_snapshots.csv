@@ -1,0 +1,6 @@
+snapshot_id,match_id,timestamp,sportsbook,market,selection,line,american_odds,decimal_odds,implied_probability
+s_0001,ext_1001,2026-07-01 12:31,FanDuel,ML_3WAY,home,,-125,1.80,0.5556
+s_0002,ext_1001,2026-07-01 13:00,FanDuel,ML_3WAY,home,,-135,1.7407,0.5745
+s_0003,ext_1001,2026-07-01 13:01:05,FanDuel,ML_3WAY,home,,-150,1.6667,0.60
+s_0004,ext_1001,2026-07-01 13:01:05,FanDuel,SPREAD_2WAY,home,-0.5,-135,1.7407,0.5745
+s_0005,ext_1002,2026-07-01 13:10,bet365,ML_3WAY,away,,100,2.00,0.50

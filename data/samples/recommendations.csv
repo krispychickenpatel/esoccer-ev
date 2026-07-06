@@ -1,0 +1,3 @@
+recommendation_id,created_at,source,league,scheduled_start,home_player,away_player,recommended_selection,acceptable_markets,max_spread,min_american_odds,ideal_american_odds,expires_at,confidence,notes
+rec_x01,2026-07-01 12:40,friend,FanDuel ESoccer,2026-07-01 13:01,Arsenal (CRUSADER),Spurs (ALIBI),Arsenal (CRUSADER),"Moneyline 3-way; Spread",-0.5,-160,-135,2026-07-01 13:01:30,high,place when live; either ML or -0.5
+rec_x02,2026-07-02 10:20,model,GT League,2026-07-02 10:35,Aston Villa (PROPHET),Spurs (ALIBI),Aston Villa (PROPHET),"Moneyline 3-way",,140,160,2026-07-02 10:35:30,medium,model-generated example row

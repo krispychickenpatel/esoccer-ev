@@ -1,0 +1,11 @@
+bet_id,date_time_placed,sportsbook,sport,league,market,selection,opponent,line,american_odds,decimal_odds,stake,result,payout,profit,closing_american_odds,notes,screenshot_file
+seed_bet_001,2026-05-13 13:50,FanDuel,ESoccer,Esoccer H2H GG League - 8 mins play,ML_3WAY,Spurs (CRUSADER),Newcastle UTD (ALIBI),,-135,,550,win,957.41,407.41,,Settled screenshot; one of two same-match bets.,screenshot_seed
+seed_bet_002,2026-05-13 13:50,FanDuel,ESoccer,Esoccer H2H GG League - 8 mins play,SPREAD_2WAY,Spurs (CRUSADER),Newcastle UTD (ALIBI),-0.5,-135,,550,win,957.41,407.41,,Settled screenshot; spread leg won.,screenshot_seed
+seed_bet_003,2026-06-11 13:31,FanDuel,ESoccer,Esoccer H2H GG League - 8 mins play,ML_3WAY,Newcastle UTD (AMBASSADOR),Aston Villa (ALIBI),,-110,,1000,win,1909.09,909.09,,Settled screenshot. NOTE (D14): team skins differ from rec_004 narrative ('Ambassador vs Alibi') — preserved as written; correct via Seed Review.,screenshot_seed
+seed_bet_004,2026-06-23 13:20,FanDuel,ESoccer,Esoccer H2H GG League - 8 mins play,ML_3WAY,Portugal (BLITZ),Norway (ALIBI),,100,,200,win,400,200,,Settled screenshot.,screenshot_seed
+seed_bet_005,2026-06-23 13:20,FanDuel,ESoccer,Esoccer H2H GG League - 8 mins play,SPREAD_2WAY,Portugal (BLITZ),Norway (ALIBI),-0.5,-105,,210,win,410,200,,Settled screenshot.,screenshot_seed
+seed_bet_006,2026-06-24 13:20,FanDuel,ESoccer,Esoccer H2H GG League - 8 mins play,ML_3WAY,Morocco (BLITZ),Qatar (ALIBI),,120,,166,win,365.2,199.2,,Settled screenshot (matches rec_007 window).,screenshot_seed
+seed_bet_007,2026-06-30 13:46,FanDuel,ESoccer,Esoccer H2H GG League - 8 mins play,ML_3WAY,Spurs (BLITZ),Arsenal (ALIBI),,125,,100,win,225,125,,Settled screenshot.,screenshot_seed
+seed_bet_008,2026-06-30 13:46,FanDuel,ESoccer,Esoccer H2H GG League - 8 mins play,SPREAD_2WAY,Spurs (BLITZ),Arsenal (ALIBI),-0.5,120,,96.15,win,211.53,115.38,,Settled screenshot.,screenshot_seed
+seed_bet_009,2026-07-01 13:01,FanDuel,ESoccer,Esoccer H2H GG League - 8 mins play,ML_3WAY,Arsenal (CRUSADER),Spurs (ALIBI),,-140,,280,win,480,200,,Settled screenshot.,screenshot_seed
+seed_bet_010,2026-07-01 13:01,FanDuel,ESoccer,Esoccer H2H GG League - 8 mins play,SPREAD_2WAY,Arsenal (CRUSADER),Spurs (ALIBI),-0.5,-135,,270,win,470,200,,Settled screenshot.,screenshot_seed

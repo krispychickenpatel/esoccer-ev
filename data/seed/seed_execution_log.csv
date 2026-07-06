@@ -1,0 +1,1 @@
+execution_id,recommendation_id,sportsbook,opened_at,live_detected_at,bet_placed_at,actual_market,actual_line,actual_american_odds,stake,accepted_odds_movement,was_within_window,latency_seconds,status,notes

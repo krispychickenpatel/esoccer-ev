@@ -1,0 +1,4 @@
+title,test_type,params
+BLITZ profitable when backed,player_backed_roi,"{""player"":""BLITZ""}"
+CRUSADER profitable when backed,player_backed_roi,"{""player"":""CRUSADER""}"
+ML vs spread above 8% EV,market_vs_market,"{""min_ev_pct"":8}"

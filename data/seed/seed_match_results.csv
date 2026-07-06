@@ -1,0 +1,7 @@
+match_id,start_time,league,home_player,away_player,home_score,away_score,winner,source
+seedm_001,2026-05-13 13:50,Esoccer H2H GG League - 8 mins play,Spurs (CRUSADER),Newcastle UTD (ALIBI),,,home,manual_seed
+seedm_002,2026-06-11 13:31,Esoccer H2H GG League - 8 mins play,Newcastle UTD (AMBASSADOR),Aston Villa (ALIBI),,,home,manual_seed
+seedm_003,2026-06-23 13:20,Esoccer H2H GG League - 8 mins play,Portugal (BLITZ),Norway (ALIBI),,,home,manual_seed
+seedm_004,2026-06-24 13:20,Esoccer H2H GG League - 8 mins play,Morocco (BLITZ),Qatar (ALIBI),,,home,manual_seed
+seedm_005,2026-06-30 13:46,Esoccer H2H GG League - 8 mins play,Spurs (BLITZ),Arsenal (ALIBI),,,home,manual_seed
+seedm_006,2026-07-01 13:01,Esoccer H2H GG League - 8 mins play,Arsenal (CRUSADER),Spurs (ALIBI),,,home,manual_seed
