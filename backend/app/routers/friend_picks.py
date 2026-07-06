@@ -53,6 +53,12 @@ def report(db: Session = Depends(get_db)):
     return fp.report(db)
 
 
+@router.get("/verify-integrity")
+def verify_integrity(db: Session = Depends(get_db)):
+    """Recompute every FriendPick's hash; any mismatch = tampered ledger."""
+    return fp.verify_integrity(db)
+
+
 @router.get("/{pick_id}")
 def get_one(pick_id: int, db: Session = Depends(get_db)):
     p = db.get(FriendPick, pick_id)

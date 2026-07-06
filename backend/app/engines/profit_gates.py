@@ -103,9 +103,16 @@ def feed_gate(db: Session) -> dict:
     }
 
 
-def _steam_sample(db: Session, source: str) -> list[tuple[bool, int]]:
-    """Returns [(subject_steam_correct, match_id), ...] for scored rows,
-    restricted to gold/silver reality tier where that's determinable."""
+def _steam_sample(db: Session, source: str) -> list[tuple[bool, int, str, datetime]]:
+    """Returns RAW [(subject_steam_correct, match_id, selection, sample_time), ...]
+    rows, restricted to gold/silver reality tier where that's determinable.
+    Deliberately NOT deduplicated here -- one match/selection frozen at
+    multiple horizons produces multiple PredictionScore rows that all
+    describe the SAME underlying reality outcome (did this selection's
+    price shorten), not independent trials. signal_gate() dedupes so both
+    raw_rows and distinct_samples can be reported honestly (v0.3.6.1 audit
+    fix -- v0.3.6 reported n=446 raw rows as if independent, when only 58
+    distinct matches / 174 distinct (match,selection) pairs backed it)."""
     out = []
     if source == "model":
         rows = db.scalars(select(PredictionScore).where(
@@ -114,29 +121,49 @@ def _steam_sample(db: Session, source: str) -> list[tuple[bool, int]]:
             pred = db.get(PredictionLedger, r.prediction_id)
             reality = db.get(PredictionReality, r.reality_id)
             if pred and reality and reality.dataset_tier in ("gold", "silver"):
-                out.append((r.steam_direction_correct, pred.match_id))
+                out.append((r.steam_direction_correct, pred.match_id, pred.selection, pred.prediction_time))
     else:
         rows = db.scalars(select(FriendPickScore).where(
             FriendPickScore.steam_direction_correct.is_not(None))).all()
         for r in rows:
             pick = db.get(FriendPick, r.friend_pick_id)
             if pick and pick.match_id:
-                out.append((r.steam_direction_correct, pick.match_id))
+                out.append((r.steam_direction_correct, pick.match_id, pick.pick_side, pick.effective_known_at))
     return out
+
+
+def _dedup_by_match_selection(sample: list[tuple[bool, int, str, datetime]]) -> dict[tuple[int, str], bool]:
+    """One value per (match_id, selection) -- repeated horizons of the same
+    match/selection are the same underlying reality outcome, not independent
+    samples. Keeps the row with the latest sample_time per group (closest to
+    kickoff / most information), so the result is deterministic regardless
+    of DB row-return order."""
+    best: dict[tuple[int, str], tuple[datetime, bool]] = {}
+    for correct, match_id, selection, sample_time in sample:
+        key = (match_id, selection)
+        if key not in best or sample_time > best[key][0]:
+            best[key] = (sample_time, correct)
+    return {k: v[1] for k, v in best.items()}
 
 
 def signal_gate(db: Session, source: str) -> dict:
     sample = _steam_sample(db, source)
-    n = len(sample)
+    raw_rows = len(sample)
+    dedup = _dedup_by_match_selection(sample)
+    distinct_samples = len(dedup)
+    # Gate threshold and accuracy use distinct_samples, NEVER raw_rows --
+    # raw_rows is reported alongside purely for transparency (v0.3.6.1 fix).
+    n = distinct_samples
     if n < MIN_SIGNAL_SAMPLE:
-        return {"status": "NOT ENOUGH DATA", "n": n, "accuracy_pct": None,
+        return {"status": "NOT ENOUGH DATA", "n": n, "raw_rows": raw_rows,
+               "distinct_samples": distinct_samples, "accuracy_pct": None,
                "baseline_accuracy_pct": None, "margin_pts": None}
-    correct = sum(1 for c, _ in sample if c)
-    accuracy = 100 * correct / n
+    correct_count = sum(1 for c in dedup.values() if c)
+    accuracy = 100 * correct_count / n
 
     baseline_correct = 0
     baseline_n = 0
-    for _, match_id in sample:
+    for (match_id, _selection) in dedup:
         m = db.get(Match, match_id)
         if not m:
             continue
@@ -155,7 +182,8 @@ def signal_gate(db: Session, source: str) -> dict:
     baseline_accuracy = (100 * baseline_correct / baseline_n) if baseline_n else None
     margin = (accuracy - baseline_accuracy) if baseline_accuracy is not None else None
     status = "PASS" if (margin is not None and margin >= SIGNAL_GATE_MARGIN_PTS) else "FAIL"
-    return {"status": status, "n": n, "accuracy_pct": round(accuracy, 1),
+    return {"status": status, "n": n, "raw_rows": raw_rows, "distinct_samples": distinct_samples,
+           "accuracy_pct": round(accuracy, 1),
            "baseline_accuracy_pct": round(baseline_accuracy, 1) if baseline_accuracy is not None else None,
            "margin_pts": round(margin, 1) if margin is not None else None,
            "baseline_n": baseline_n}

@@ -85,7 +85,7 @@ export default function FriendPicks() {
         <h3>Pending / unresolved ({pending.length})</h3>
         {pending.length === 0 ? <div className="empty">Nothing pending.</div> : (
           <table>
-            <thead><tr><th>Created</th><th>Match</th><th>Side</th><th>Odds</th><th>Book</th><th>Resolution</th><th>Backfilled</th></tr></thead>
+            <thead><tr><th>Created</th><th>Match</th><th>Side</th><th>Odds</th><th>Book</th><th>Resolution</th><th>Flags</th></tr></thead>
             <tbody>{pending.map(p => (
               <tr key={p.id}>
                 <td className="mono small">{fmtDT(p.created_at)}</td>
@@ -94,7 +94,10 @@ export default function FriendPicks() {
                 <td className="mono">{p.odds_at_pick_decimal}</td>
                 <td>{p.book_seen}</td>
                 <td><span className={`badge ${p.resolution_status === 'RESOLVED' ? 'pos' : 'amber'}`}>{p.resolution_status}</span></td>
-                <td>{p.is_backfilled ? <span className="badge amber">late</span> : ''}</td>
+                <td>
+                  {p.is_backfilled && <span className="badge amber">late</span>}
+                  {p.likely_test_artifact && <span className="badge muted" title="Created long after kickoff -- heuristic only, not stored, not used in gates">likely test</span>}
+                </td>
               </tr>
             ))}</tbody>
           </table>
@@ -105,10 +108,10 @@ export default function FriendPicks() {
         <h3>Scored ({scored.length})</h3>
         {scored.length === 0 ? <div className="empty">No scored picks yet.</div> : (
           <table>
-            <thead><tr><th>Match</th><th>Side</th><th>Winner correct</th><th>Steam correct</th><th>Proxy CLV</th><th>Paper P/L</th><th>vs Model</th><th>vs Baseline</th><th>Error bucket</th></tr></thead>
+            <thead><tr><th>Match</th><th>Side</th><th>Winner correct</th><th>Steam correct</th><th>Proxy CLV</th><th>Paper P/L</th><th>vs Model</th><th>vs Baseline</th><th>Error bucket</th><th>Price source</th></tr></thead>
             <tbody>{scored.map(p => (
               <tr key={p.id}>
-                <td>{p.home_name} vs {p.away_name}</td>
+                <td>{p.home_name} vs {p.away_name} {p.likely_test_artifact && <span className="badge muted" title="Created long after kickoff -- heuristic only">test?</span>}</td>
                 <td>{p.pick_side}</td>
                 <td>{p.score?.winner_correct === null ? '—' : p.score?.winner_correct ? 'yes' : 'no'}</td>
                 <td>{p.score?.steam_direction_correct === null ? '—' : p.score?.steam_direction_correct ? 'yes' : 'no'}</td>
@@ -117,6 +120,11 @@ export default function FriendPicks() {
                 <td>{p.score?.vs_model_comparison}</td>
                 <td>{p.score?.vs_baseline_comparison}</td>
                 <td className="small">{p.score?.error_bucket}</td>
+                <td className="small">
+                  {p.scoring_price_source ?? '—'}
+                  {p.is_reference_feed_proxy && <span className="badge amber" title="Scored using reference-feed (bet365) odds, not a verified price from the book you actually saw">proxy</span>}
+                  {p.book_verified_for_execution && <span className="badge pos" title="This book is a verified non-reference execution candidate">verified</span>}
+                </td>
               </tr>
             ))}</tbody>
           </table>

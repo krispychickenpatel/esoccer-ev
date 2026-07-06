@@ -48,19 +48,21 @@ def test_friend_picks_are_immutable_and_tamper_detected():
         "odds_at_pick_decimal": 2.10, "book_seen": "bet365 app",
     })
     original_hash = pick.immutable_hash
-    # Recomputing the hash from the same frozen fields must match.
-    frozen = friend_picks._freeze_payload(pick.pick_timestamp, pick.effective_known_at,
-                                          pick.home_name, pick.away_name, pick.pick_side,
-                                          pick.odds_at_pick_decimal, pick.book_seen,
-                                          pick.league, pick.kickoff_time)
+    # New picks hash under v2 (v0.3.6.1) -- recomputing from the same
+    # frozen fields must match.
+    frozen = friend_picks._freeze_payload_v2(
+        pick.pick_timestamp, pick.effective_known_at, pick.home_name, pick.away_name,
+        pick.pick_side, pick.odds_at_pick_decimal, pick.odds_at_pick_american,
+        pick.book_seen, pick.league, pick.kickoff_time, pick.reason, pick.confidence,
+        pick.provider_event_id)
     assert friend_picks._freeze_hash(frozen) == original_hash
-    # Tampering with a frozen field must be detectable by hash mismatch.
+    # Tampering with a frozen field must be detectable via verify_integrity.
+    assert friend_picks.verify_integrity(db)["invalid"] == 0
     pick.odds_at_pick_decimal = 5.0
-    tampered = friend_picks._freeze_payload(pick.pick_timestamp, pick.effective_known_at,
-                                            pick.home_name, pick.away_name, pick.pick_side,
-                                            pick.odds_at_pick_decimal, pick.book_seen,
-                                            pick.league, pick.kickoff_time)
-    assert friend_picks._freeze_hash(tampered) != original_hash
+    db.commit()
+    report = friend_picks.verify_integrity(db)
+    assert report["invalid"] == 1
+    assert pick.id in report["invalid_ids"]
 
 
 def test_friend_pick_correction_creates_new_row_never_edits_original():

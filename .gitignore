@@ -5,3 +5,7 @@ __pycache__/
 esoccer.db
 .env
 .venv/
+*.log
+*.tsbuildinfo
+backend/*.log
+frontend/*.log

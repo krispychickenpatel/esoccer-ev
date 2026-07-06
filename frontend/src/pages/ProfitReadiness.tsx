@@ -51,22 +51,28 @@ export default function ProfitReadiness() {
       <div className="grid cols-2" style={{ marginTop: 16 }}>
         <div className="card">
           <h3>Signal gate — model</h3>
+          <p className="muted small">Gate uses distinct_samples (independent match+selection outcomes), never raw_rows (repeated horizons of the same outcome).</p>
           <table><tbody>
             <tr><td>Status</td><td><StatusBadge status={g.signal_gate_model.status} /></td></tr>
             <tr><td>Steam accuracy</td><td className="mono">{g.signal_gate_model.accuracy_pct ?? '—'}%</td></tr>
             <tr><td>Baseline accuracy</td><td className="mono">{g.signal_gate_model.baseline_accuracy_pct ?? '—'}%</td></tr>
             <tr><td>Margin</td><td className="mono">{g.signal_gate_model.margin_pts ?? '—'} pts</td></tr>
-            <tr><td>n</td><td className="mono">{g.signal_gate_model.n}</td></tr>
+            <tr><td>n (= distinct_samples)</td><td className="mono">{g.signal_gate_model.n}</td></tr>
+            <tr><td>distinct_samples</td><td className="mono">{g.signal_gate_model.distinct_samples ?? '—'}</td></tr>
+            <tr><td>raw_rows (not used for the gate)</td><td className="mono muted">{g.signal_gate_model.raw_rows ?? '—'}</td></tr>
           </tbody></table>
         </div>
         <div className="card">
           <h3>Signal gate — friend</h3>
+          <p className="muted small">Gate uses distinct_samples (independent match+selection outcomes), never raw_rows (repeated horizons of the same outcome).</p>
           <table><tbody>
             <tr><td>Status</td><td><StatusBadge status={g.signal_gate_friend.status} /></td></tr>
             <tr><td>Steam accuracy</td><td className="mono">{g.signal_gate_friend.accuracy_pct ?? '—'}%</td></tr>
             <tr><td>Baseline accuracy</td><td className="mono">{g.signal_gate_friend.baseline_accuracy_pct ?? '—'}%</td></tr>
             <tr><td>Margin</td><td className="mono">{g.signal_gate_friend.margin_pts ?? '—'} pts</td></tr>
-            <tr><td>n</td><td className="mono">{g.signal_gate_friend.n}</td></tr>
+            <tr><td>n (= distinct_samples)</td><td className="mono">{g.signal_gate_friend.n}</td></tr>
+            <tr><td>distinct_samples</td><td className="mono">{g.signal_gate_friend.distinct_samples ?? '—'}</td></tr>
+            <tr><td>raw_rows (not used for the gate)</td><td className="mono muted">{g.signal_gate_friend.raw_rows ?? '—'}</td></tr>
           </tbody></table>
         </div>
       </div>

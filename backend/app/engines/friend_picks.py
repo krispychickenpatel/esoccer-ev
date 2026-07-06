@@ -22,8 +22,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import (FriendPick, FriendPickScore, Match, OddsSnapshot,
-                      PredictionLedger, PredictionReality, Settings)
+from ..models import (BookmakerCoverage, FriendPick, FriendPickScore, Match,
+                      OddsSnapshot, PredictionLedger, PredictionReality, Settings)
 from . import odds_math
 from .execution_pricing import latest_snapshot_for, price_at_delay
 from .execution_strategy import classify_execution_mode
@@ -32,10 +32,18 @@ from .steam import steam_prediction_for_snapshot
 
 BACKFILL_THRESHOLD_SECONDS = 120
 RESOLUTION_KICKOFF_TOLERANCE = timedelta(minutes=10)
+# v0.3.6.1: a pick logged more than this long after its own kickoff is very
+# unlikely to be a real live pick -- surfaced as a read-only diagnostic
+# (likely_test_artifact in pick_out), never used to silently exclude
+# anything or mutate data.
+LIKELY_TEST_ARTIFACT_THRESHOLD = timedelta(minutes=60)
 
+# v0.3.6.1: RESULT_RIGHT_NO_EDGE renamed to RESULT_RIGHT_NO_MARKET_EDGE per
+# audit fix spec. The dead "OK" bucket from v0.3.6 is gone -- every scored
+# pick now lands in exactly one of these 7, see _classify_friend_error_bucket.
 ERROR_BUCKETS = (
     "CORRECT_SIDE_BAD_PRICE", "WRONG_SIDE", "STEAM_RIGHT_RESULT_WRONG",
-    "RESULT_RIGHT_NO_EDGE", "MISSED_EXECUTION_WINDOW", "DATA_UNAVAILABLE",
+    "RESULT_RIGHT_NO_MARKET_EDGE", "MISSED_EXECUTION_WINDOW", "DATA_UNAVAILABLE",
     "BOOK_UNAVAILABLE",
 )
 
@@ -48,8 +56,10 @@ def _dumps(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, default=str, separators=(",", ":"))
 
 
-def _freeze_payload(pick_timestamp, effective_known_at, home_name, away_name,
-                    pick_side, odds_at_pick_decimal, book_seen, league, kickoff_time) -> dict:
+def _freeze_payload_v1(pick_timestamp, effective_known_at, home_name, away_name,
+                       pick_side, odds_at_pick_decimal, book_seen, league, kickoff_time) -> dict:
+    """Original v0.3.6 hash payload. Kept byte-for-byte so pre-v0.3.6.1 rows
+    still verify -- never used for new rows."""
     return {
         "pick_timestamp": pick_timestamp.isoformat(),
         "effective_known_at": effective_known_at.isoformat(),
@@ -58,6 +68,31 @@ def _freeze_payload(pick_timestamp, effective_known_at, home_name, away_name,
         "book_seen": book_seen, "league": league,
         "kickoff_time": kickoff_time.isoformat() if kickoff_time else None,
     }
+
+
+def _freeze_payload_v2(pick_timestamp, effective_known_at, home_name, away_name,
+                       pick_side, odds_at_pick_decimal, odds_at_pick_american,
+                       book_seen, league, kickoff_time, reason, confidence,
+                       provider_event_id) -> dict:
+    """v0.3.6.1: covers every user-entered original pick field, so tampering
+    with reason/confidence/odds_at_pick_american/provider_event_id is
+    detectable too. Used for every row created from v0.3.6.1 onward."""
+    return {
+        "pick_timestamp": pick_timestamp.isoformat(),
+        "effective_known_at": effective_known_at.isoformat(),
+        "home_name": home_name, "away_name": away_name,
+        "pick_side": pick_side, "odds_at_pick_decimal": odds_at_pick_decimal,
+        "odds_at_pick_american": odds_at_pick_american,
+        "book_seen": book_seen, "league": league,
+        "kickoff_time": kickoff_time.isoformat() if kickoff_time else None,
+        "reason": reason, "confidence": confidence,
+        "provider_event_id": provider_event_id,
+    }
+
+
+# Backward-compat alias -- some call sites/tests still refer to the
+# original name. Always the v1 (original) payload shape.
+_freeze_payload = _freeze_payload_v1
 
 
 def _freeze_hash(payload: dict) -> str:
@@ -146,10 +181,15 @@ def create_friend_pick(db: Session, payload: dict) -> FriendPick:
     if odds_am is None:
         odds_am = odds_math.decimal_to_american(odds_dec)
 
-    frozen = _freeze_payload(pick_timestamp, effective_known_at,
-                             payload.get("home_name", ""), payload.get("away_name", ""),
-                             payload["pick_side"], odds_dec, payload.get("book_seen", ""),
-                             payload.get("league", ""), kickoff_time)
+    # v0.3.6.1: all new rows hash under v2 (covers reason/confidence/
+    # odds_at_pick_american/provider_event_id too). Existing pre-v0.3.6.1
+    # rows keep their original v1 hash -- verify_integrity() accepts either.
+    frozen = _freeze_payload_v2(pick_timestamp, effective_known_at,
+                                payload.get("home_name", ""), payload.get("away_name", ""),
+                                payload["pick_side"], odds_dec, odds_am,
+                                payload.get("book_seen", ""), payload.get("league", ""),
+                                kickoff_time, payload.get("reason", ""),
+                                payload.get("confidence"), payload.get("provider_event_id"))
 
     pick = FriendPick(
         created_at=now, pick_timestamp=pick_timestamp, effective_known_at=effective_known_at,
@@ -261,6 +301,54 @@ def _reality_row_for(db: Session, match_id: int, selection: str, market: str = "
     return rows[0]
 
 
+def _check_book_coverage(db: Session, book_seen: str | None) -> str:
+    """Never guesses. Returns:
+    - "verified"    -- book_seen matches a scanned BookmakerCoverage row
+                       with status WORKS.
+    - "unavailable" -- book_seen matches a scanned row with any other
+                       status (EMPTY/BROKEN/UNKNOWN) -- genuine, proven.
+    - "unknown"     -- book_seen is blank, no scan has EVER run, or this
+                       specific book was never scanned. Not proof of
+                       unavailability -- callers must not treat this as
+                       BOOK_UNAVAILABLE."""
+    if not book_seen or not book_seen.strip():
+        return "unknown"
+    rows = db.scalars(select(BookmakerCoverage)).all()
+    if not rows:
+        return "unknown"  # no scan has ever run -- never guess
+    needle = book_seen.lower()
+    for r in rows:
+        if r.source_name.lower() in needle:
+            return "verified" if r.status == "WORKS" else "unavailable"
+    return "unknown"  # this specific book was never scanned
+
+
+def _classify_friend_error_bucket(*, book_check: str, winner_correct: bool | None,
+                                  steam_direction_correct: bool | None,
+                                  proxy_clv_pct: float | None,
+                                  entry_price_survived: bool | None) -> str:
+    """Pure decision table -- exhaustive, mutually exclusive, exactly the 7
+    spec'd buckets. No 'OK' escape hatch (v0.3.6 bug, fixed in v0.3.6.1)."""
+    if book_check == "unavailable":
+        return "BOOK_UNAVAILABLE"
+    if winner_correct is None:
+        return "DATA_UNAVAILABLE"
+    if not winner_correct:
+        # Result wrong. If the market agreed with the pick pre-result
+        # (price shortened), the read was right and the result wasn't --
+        # otherwise it was just the wrong side, full stop.
+        return "STEAM_RIGHT_RESULT_WRONG" if steam_direction_correct is True else "WRONG_SIDE"
+    # winner_correct is True from here.
+    if entry_price_survived is False:
+        return "MISSED_EXECUTION_WINDOW"
+    if proxy_clv_pct is not None and proxy_clv_pct < 0:
+        return "CORRECT_SIDE_BAD_PRICE"
+    # Won, price data either fine or unavailable, nothing else to flag.
+    # There is no 8th "won with a real edge" bucket in the spec -- this is
+    # the correct default per the closed 7-bucket contract.
+    return "RESULT_RIGHT_NO_MARKET_EDGE"
+
+
 def score_friend_pick(db: Session, pick: FriendPick) -> FriendPickScore | None:
     """Only RESOLVED picks with a known result can be scored. Never uses
     data timestamped after pick.effective_known_at for anything that claims
@@ -280,15 +368,18 @@ def score_friend_pick(db: Session, pick: FriendPick) -> FriendPickScore | None:
     stake_units = 1.0
     stake_usd = (settings.paper_stake_usd if settings else 100.0)
 
+    book_check = _check_book_coverage(db, pick.book_seen)
     reality = _reality_row_for(db, match.id, pick.pick_side)
     if match.home_score is None or match.away_score is None:
-        if reality is None:
+        if book_check == "unavailable":
+            error_bucket = "BOOK_UNAVAILABLE"
+        elif reality is None:
             error_bucket = "DATA_UNAVAILABLE"
         else:
             error_bucket = "MISSED_EXECUTION_WINDOW" if "missing_first_live" in json.loads(reality.warnings_json or "[]") else "DATA_UNAVAILABLE"
         row = existing or FriendPickScore(friend_pick_id=pick.id)
         row.error_bucket = error_bucket
-        row.details_json = _dumps({"reason": "match result not yet available"})
+        row.details_json = _dumps({"reason": "match result not yet available", "book_check": book_check})
         row.scored_at = _now()
         if existing is None:
             db.add(row)
@@ -300,7 +391,6 @@ def score_friend_pick(db: Session, pick: FriendPick) -> FriendPickScore | None:
     post_pick_movement_cents = None
     proxy_clv_pct = None
     entry_price_survived = None
-    error_bucket = "DATA_UNAVAILABLE"
 
     if reality is not None and reality.last_pre_decimal is not None and reality.first_live_decimal is not None:
         steam_direction_correct = bool(reality.actual_shortened)
@@ -313,20 +403,10 @@ def score_friend_pick(db: Session, pick: FriendPick) -> FriendPickScore | None:
                 proxy_clv_pct = None
         entry_price_survived = reality.first_live_decimal >= pick.odds_at_pick_decimal
 
-    if winner_correct is None:
-        error_bucket = "DATA_UNAVAILABLE"
-    elif not winner_correct:
-        error_bucket = "WRONG_SIDE"
-    elif steam_direction_correct is False:
-        error_bucket = "STEAM_RIGHT_RESULT_WRONG"  # result right, steam call was wrong direction
-    elif proxy_clv_pct is not None and proxy_clv_pct < 0:
-        error_bucket = "CORRECT_SIDE_BAD_PRICE"
-    elif entry_price_survived is False:
-        error_bucket = "MISSED_EXECUTION_WINDOW"
-    else:
-        error_bucket = "RESULT_RIGHT_NO_EDGE" if (proxy_clv_pct is None or proxy_clv_pct <= 0) else "RESULT_RIGHT_NO_EDGE"
-        if winner_correct and (proxy_clv_pct or 0) > 0:
-            error_bucket = "RESULT_RIGHT_NO_EDGE" if proxy_clv_pct <= 0.5 else "OK"
+    error_bucket = _classify_friend_error_bucket(
+        book_check=book_check, winner_correct=winner_correct,
+        steam_direction_correct=steam_direction_correct,
+        proxy_clv_pct=proxy_clv_pct, entry_price_survived=entry_price_survived)
 
     paper_pl_usd = None
     if winner_correct is not None:
@@ -371,6 +451,7 @@ def score_friend_pick(db: Session, pick: FriendPick) -> FriendPickScore | None:
     row.details_json = _dumps({
         "reality_available": reality is not None,
         "book_used": reality.sportsbook if reality else None,
+        "book_check": book_check,
     })
     row.scored_at = _now()
     if existing is None:
@@ -391,6 +472,46 @@ def score_all_resolved(db: Session) -> dict:
         if result is not None and p.scoring_status == "scored" and before != "scored":
             scored += 1
     return {"checked": len(picks), "newly_scored": scored}
+
+
+_V1_HASH_FIELDS = ["pick_timestamp", "effective_known_at", "home_name", "away_name",
+                  "pick_side", "odds_at_pick_decimal", "book_seen", "league", "kickoff_time"]
+_V2_HASH_FIELDS = _V1_HASH_FIELDS + ["odds_at_pick_american", "reason", "confidence", "provider_event_id"]
+
+
+def verify_integrity(db: Session, limit: int = 5000) -> dict:
+    """Recompute each FriendPick's hash and compare with immutable_hash.
+    Rows created before v0.3.6.1 were hashed under the narrower v1 payload
+    (see _freeze_payload_v1); rows from v0.3.6.1 onward use v2 (covers
+    reason/confidence/odds_at_pick_american/provider_event_id too). A row
+    is valid if it matches EITHER reconstruction -- this never invalidates
+    existing rows just because the hash contract grew."""
+    rows = db.scalars(select(FriendPick).order_by(FriendPick.id).limit(limit)).all()
+    invalid_ids: list[int] = []
+    for p in rows:
+        v2 = _freeze_payload_v2(p.pick_timestamp, p.effective_known_at, p.home_name, p.away_name,
+                                p.pick_side, p.odds_at_pick_decimal, p.odds_at_pick_american,
+                                p.book_seen, p.league, p.kickoff_time, p.reason, p.confidence,
+                                p.provider_event_id)
+        v1 = _freeze_payload_v1(p.pick_timestamp, p.effective_known_at, p.home_name, p.away_name,
+                                p.pick_side, p.odds_at_pick_decimal, p.book_seen, p.league,
+                                p.kickoff_time)
+        if _freeze_hash(v2) == p.immutable_hash or _freeze_hash(v1) == p.immutable_hash:
+            continue
+        invalid_ids.append(p.id)
+    return {
+        "checked": len(rows),
+        "valid": len(rows) - len(invalid_ids),
+        "invalid": len(invalid_ids),
+        "invalid_ids": invalid_ids[:50],
+        "hash_fields_v1": _V1_HASH_FIELDS,
+        "hash_fields_v2": _V2_HASH_FIELDS,
+        "caveat": ("Rows created before v0.3.6.1 were hashed under the v1 payload (fewer "
+                  "fields) and are verified against that shape; rows from v0.3.6.1 onward "
+                  "use v2. A row is valid if it matches either shape -- this is intentional "
+                  "and does not weaken tamper detection for any individual row, since each "
+                  "row only ever had one real original hash."),
+    }
 
 
 def report(db: Session) -> dict:
@@ -436,6 +557,37 @@ def report(db: Session) -> dict:
 
 def pick_out(db: Session, p: FriendPick) -> dict:
     score = db.scalar(select(FriendPickScore).where(FriendPickScore.friend_pick_id == p.id))
+
+    # v0.3.6.1 Fix 6: never pretend book-specific execution was verified.
+    # scoring_price_source is whichever book's reality data actually backed
+    # the score (details_json.book_used); is_reference_feed_proxy is true
+    # whenever that differs from what book_seen literally claims (which,
+    # today, is effectively always -- we only track bet365 reality data).
+    scoring_price_source = None
+    is_reference_feed_proxy = None
+    if score is not None:
+        try:
+            details = json.loads(score.details_json or "{}")
+        except json.JSONDecodeError:
+            details = {}
+        scoring_price_source = details.get("book_used")
+        if scoring_price_source:
+            is_reference_feed_proxy = scoring_price_source.lower() not in (p.book_seen or "").lower()
+    book_verified_for_execution = False
+    if p.book_seen:
+        cov = db.scalars(select(BookmakerCoverage)).all()
+        needle = p.book_seen.lower()
+        for c in cov:
+            if c.source_name.lower() in needle:
+                book_verified_for_execution = c.status == "WORKS" and c.execution_candidate
+                break
+
+    # v0.3.6.1 Fix 7: read-only heuristic, never stored, never mutates data,
+    # never feeds into gates automatically -- surfaced so Kris can see which
+    # picks look like test artifacts entered long after the match concluded.
+    likely_test_artifact = bool(
+        p.kickoff_time and (p.created_at - p.kickoff_time) > LIKELY_TEST_ARTIFACT_THRESHOLD)
+
     return {
         "id": p.id, "created_at": p.created_at.isoformat(),
         "pick_timestamp": p.pick_timestamp.isoformat(),
@@ -451,6 +603,10 @@ def pick_out(db: Session, p: FriendPick) -> dict:
         "corrects_pick_id": p.corrects_pick_id, "immutable_hash": p.immutable_hash,
         "execution_mode": p.execution_mode,
         "execution_reason_codes": json.loads(p.execution_reason_codes_json or "[]"),
+        "scoring_price_source": scoring_price_source,
+        "is_reference_feed_proxy": is_reference_feed_proxy,
+        "book_verified_for_execution": book_verified_for_execution,
+        "likely_test_artifact": likely_test_artifact,
         "score": None if score is None else {
             "winner_correct": score.winner_correct,
             "steam_direction_correct": score.steam_direction_correct,
