@@ -32,6 +32,12 @@ LIVE_OPEN_STRESS_S = 45.0
 SIGNAL_GATE_MARGIN_PTS = 5.0
 EXECUTION_GATE_MIN_SURVIVAL_PCT = 60.0
 RISK_GATE_MAX_DRAWDOWN_UNITS = 15.0
+WINNER_EDGE_MIN_MODEL_SAMPLE = 50
+WINNER_EDGE_MIN_FRIEND_SAMPLE = 30
+# v0.3.6.2 Part C3: a pick is "likely test data" for gating purposes if
+# logged more than this long after its own kickoff -- same heuristic used
+# for FriendPick.likely_test_artifact in engines/friend_picks.py.
+FRIEND_TEST_ARTIFACT_THRESHOLD_S = 3600
 
 
 def _now() -> datetime:
@@ -192,12 +198,15 @@ def signal_gate(db: Session, source: str) -> dict:
 def execution_gate(db: Session) -> dict:
     rows = db.scalars(select(PaperTrade).where(PaperTrade.delay_seconds == 30)).all()
     n = len(rows)
+    model_n = sum(1 for r in rows if r.signal_source == "MODEL")
+    friend_n = sum(1 for r in rows if r.signal_source == "FRIEND")
     if n < MIN_EXECUTION_SAMPLE:
-        return {"status": "NOT ENOUGH DATA", "n": n, "survival_pct": None}
+        return {"status": "NOT ENOUGH DATA", "n": n, "model_n": model_n, "friend_n": friend_n,
+               "survival_pct": None}
     survived = sum(1 for r in rows if r.entry_survived)
     pct = round(100 * survived / n, 1)
     return {"status": "PASS" if pct >= EXECUTION_GATE_MIN_SURVIVAL_PCT else "FAIL",
-           "n": n, "survival_pct": pct}
+           "n": n, "model_n": model_n, "friend_n": friend_n, "survival_pct": pct}
 
 
 def book_gate(db: Session) -> dict:
@@ -214,8 +223,11 @@ def risk_gate(db: Session) -> dict:
         PaperTrade.settlement_status == "SETTLED", PaperTrade.paper_pl_usd.is_not(None),
     ).order_by(PaperTrade.created_at)).all()
     n = len(settled)
+    model_n = sum(1 for r in settled if r.signal_source == "MODEL")
+    friend_n = sum(1 for r in settled if r.signal_source == "FRIEND")
     if n < MIN_EXECUTION_SAMPLE:
-        return {"status": "NOT ENOUGH DATA", "n": n, "max_drawdown_units": None}
+        return {"status": "NOT ENOUGH DATA", "n": n, "model_n": model_n, "friend_n": friend_n,
+               "max_drawdown_units": None}
     cum = 0.0
     peak = 0.0
     max_dd_usd = 0.0
@@ -229,7 +241,63 @@ def risk_gate(db: Session) -> dict:
     unit_usd = (s.paper_stake_usd if s else 100.0) or 100.0
     max_dd_units = round(max_dd_usd / unit_usd, 2)
     return {"status": "PASS" if max_dd_units <= RISK_GATE_MAX_DRAWDOWN_UNITS else "FAIL",
-           "n": n, "max_drawdown_units": max_dd_units, "max_drawdown_usd": round(max_dd_usd, 2)}
+           "n": n, "model_n": model_n, "friend_n": friend_n,
+           "max_drawdown_units": max_dd_units, "max_drawdown_usd": round(max_dd_usd, 2)}
+
+
+def _friend_clean_scored_sample(db: Session) -> tuple[int, float | None]:
+    """n and winner accuracy over scored friend picks that are NEITHER
+    backfilled NOR a likely test artifact -- the winner_edge_gate's own,
+    stricter definition of "clean", separate from signal_gate's broader
+    steam-direction sample."""
+    picks = db.scalars(select(FriendPick).where(FriendPick.is_backfilled.is_(False))).all()
+    scores = {s.friend_pick_id: s for s in db.scalars(select(FriendPickScore)).all()}
+    clean = []
+    for p in picks:
+        if p.id not in scores:
+            continue
+        if p.kickoff_time and (p.created_at - p.kickoff_time).total_seconds() > FRIEND_TEST_ARTIFACT_THRESHOLD_S:
+            continue
+        clean.append(scores[p.id])
+    n = len(clean)
+    w = [s.winner_correct for s in clean if s.winner_correct is not None]
+    acc = round(100 * sum(w) / len(w), 1) if w else None
+    return n, acc
+
+
+def winner_edge_gate(db: Session, source: str) -> dict:
+    """PASS requires: enough independent samples, winner accuracy beating
+    the favorite baseline, AND at least one delay bucket with non-negative
+    paper ROI. Missing paper-trade data always forces NOT ENOUGH DATA, never
+    a default PASS -- ROI is null everywhere until POST
+    /api/paper-trades/simulate-all has actually run."""
+    from . import winner_edge as we
+    if source == "model":
+        rep = we.model_report(db)
+        n = rep["distinct_samples"]
+        winner_acc = rep["winner_accuracy_pct"]
+        fav_acc = rep["favorite_baseline_accuracy_pct"]
+        min_n = WINNER_EDGE_MIN_MODEL_SAMPLE
+        roi_by_delay = rep["roi_pct_by_delay_seconds"]
+    else:
+        rep = we.friend_report(db)
+        n, winner_acc = _friend_clean_scored_sample(db)
+        fav_acc = rep["favorite_baseline_accuracy_pct"]
+        min_n = WINNER_EDGE_MIN_FRIEND_SAMPLE
+        roi_by_delay = rep["roi_pct_by_delay_seconds"]
+
+    margin = round(winner_acc - fav_acc, 1) if (winner_acc is not None and fav_acc is not None) else None
+    has_paper_trade_data = any(v is not None for v in roi_by_delay.values())
+
+    if n < min_n or not has_paper_trade_data:
+        return {"status": "NOT ENOUGH DATA", "n": n, "winner_accuracy_pct": winner_acc,
+               "favorite_baseline_pct": fav_acc, "margin_pts": margin, "roi_by_delay": roi_by_delay}
+
+    beats_baseline = margin is not None and margin > 0
+    any_non_negative_roi = any(v is not None and v >= 0 for v in roi_by_delay.values())
+    status = "PASS" if (beats_baseline and any_non_negative_roi) else "FAIL"
+    return {"status": status, "n": n, "winner_accuracy_pct": winner_acc,
+           "favorite_baseline_pct": fav_acc, "margin_pts": margin, "roi_by_delay": roi_by_delay}
 
 
 def compute_all_gates(db: Session) -> dict:
@@ -239,15 +307,18 @@ def compute_all_gates(db: Session) -> dict:
     execution = execution_gate(db)
     book = book_gate(db)
     risk = risk_gate(db)
+    winner_edge_model = winner_edge_gate(db, "model")
+    winner_edge_friend = winner_edge_gate(db, "friend")
     health = pipeline_health(db)
 
     gates = {
         "feed_gate": feed, "signal_gate_model": signal_model, "signal_gate_friend": signal_friend,
         "execution_gate": execution, "book_gate": book, "risk_gate": risk,
+        "winner_edge_gate_model": winner_edge_model, "winner_edge_gate_friend": winner_edge_friend,
     }
     statuses = [feed["pre_kickoff"]["status"], feed["live_open_manual"]["status"],
                signal_model["status"], signal_friend["status"], execution["status"],
-               book["status"], risk["status"]]
+               book["status"], risk["status"], winner_edge_model["status"], winner_edge_friend["status"]]
     if any(s == "NOT ENOUGH DATA" for s in statuses):
         overall = "NOT ENOUGH DATA"
     elif all(s == "PASS" for s in statuses):

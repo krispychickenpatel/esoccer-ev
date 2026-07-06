@@ -1,4 +1,4 @@
-"""Paper Trade Engine API (v0.3.6 Module 6). No real betting."""
+"""Paper Trade Engine API (v0.3.6 Module 6, fixed in v0.3.6.2). No real betting."""
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..engines import paper_trade as pt
-from ..models import PaperTrade, PredictionLedger
+from ..models import PaperTrade
 
 router = APIRouter(prefix="/api/paper-trades", tags=["paper-trades"])
 
@@ -31,6 +31,13 @@ def list_trades(signal_source: str | None = None, db: Session = Depends(get_db))
     } for r in rows]}
 
 
+@router.get("/eligibility")
+def eligibility(db: Session = Depends(get_db)):
+    """Diagnostic: exactly which MODEL/FRIEND signals are eligible for paper
+    trading right now, and why anything is skipped. Read-only, no side effects."""
+    return pt.eligibility_report(db)
+
+
 @router.get("/report")
 def report(db: Session = Depends(get_db)):
     pt.resettle_all(db)
@@ -48,7 +55,7 @@ def simulate(payload: SimulateIn, db: Session = Depends(get_db)):
     if src == "MODEL":
         trades = pt.simulate_model_candidate(db, payload.signal_id)
         if trades is None:
-            raise HTTPException(404, "PredictionLedger row not found, or action != BET")
+            raise HTTPException(404, "PredictionLedger row not found, or missing match/selection/signal time")
     elif src == "FRIEND":
         trades = pt.simulate_friend_pick(db, payload.signal_id)
         if trades is None:
@@ -63,23 +70,7 @@ def simulate(payload: SimulateIn, db: Session = Depends(get_db)):
 
 @router.post("/simulate-all")
 def simulate_all(db: Session = Depends(get_db)):
-    """Bulk convenience: simulate every BET model prediction and every
-    RESOLVED friend pick that hasn't been simulated yet."""
-    from ..models import FriendPick
-    created_model = 0
-    for pred in db.scalars(select(PredictionLedger).where(PredictionLedger.action == "BET")).all():
-        existing = db.scalar(select(PaperTrade).where(
-            PaperTrade.signal_source == "MODEL", PaperTrade.signal_id == pred.id))
-        if existing is None:
-            pt.simulate_model_candidate(db, pred.id)
-            created_model += 1
-    created_friend = 0
-    for pick in db.scalars(select(FriendPick).where(FriendPick.resolution_status == "RESOLVED")).all():
-        existing = db.scalar(select(PaperTrade).where(
-            PaperTrade.signal_source == "FRIEND", PaperTrade.signal_id == pick.id))
-        if existing is None:
-            pt.simulate_friend_pick(db, pick.id)
-            created_friend += 1
-    pt.resettle_all(db)
-    return {"disclaimer": pt.DISCLAIMER, "model_signals_simulated": created_model,
-            "friend_signals_simulated": created_friend}
+    """Bulk convenience: simulate every structurally-eligible MODEL
+    prediction and every RESOLVED friend pick that hasn't been simulated
+    yet. See engines/paper_trade.py for the v0.3.6.2 eligibility fix."""
+    return pt.simulate_all(db)
