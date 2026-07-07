@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .database import SessionLocal, init_db
-from .routers import (admin, bets, data, engine, friend_picks, lab, paper_trades,
+from .routers import (admin, bets, data, engine, friend_picks, lab, ops, paper_trades,
                       picks, profit, provider_ext, recs, research)
 
 
@@ -53,6 +53,7 @@ app.include_router(friend_picks.router)
 app.include_router(paper_trades.router)
 app.include_router(profit.router)
 app.include_router(provider_ext.router)
+app.include_router(ops.router)
 
 _poller_task: asyncio.Task | None = None
 

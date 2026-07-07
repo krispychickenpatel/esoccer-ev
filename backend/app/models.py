@@ -72,6 +72,24 @@ class OddsSnapshot(Base):
     seconds_to_kickoff: Mapped[float | None] = mapped_column(Float, nullable=True)  # negative = after KO
     data_source: Mapped[str] = mapped_column(String(30), default="csv_import")
     verification_status: Mapped[str] = mapped_column(String(20), default="user_verified")
+    # v0.3.7B: true system-observation timestamps (additive, all nullable).
+    # collected_at is UNCHANGED and remains provider event-time (BetsAPI's own
+    # add_time) -- see notes/triage/v0_3_7A-census.md Gate G1. source_ts is a
+    # same-value alias for collected_at so future code can be explicit about
+    # which clock it means without touching the legacy field. polled_at/
+    # response_received_at/ingested_at are OUR wall clock, populated going
+    # forward by the provider/poller; historical rows keep these NULL rather
+    # than a fabricated backfill.
+    source_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    polled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    response_received_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    ingested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    poll_cycle_id: Mapped[int | None] = mapped_column(ForeignKey("poll_cycles.id"), nullable=True)
+    raw_response_id: Mapped[int | None] = mapped_column(ForeignKey("raw_provider_responses.id"), nullable=True)
+    provider_event_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    provider_book: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    market_available: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    availability_state: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
 
 class Bet(Base, TimestampMixin):
@@ -187,6 +205,14 @@ class Settings(Base):
     # v0.3.6: dollar value of one paper-trade "unit". Paper P/L is reported
     # in units and in USD (units * this). Not a real-money setting.
     paper_stake_usd: Mapped[float] = mapped_column(Float, default=100.0)
+    # v0.3.7B: near-kickoff densified polling. Ships OFF by default -- this
+    # release builds and unit-tests the scheduler/backoff/heartbeat
+    # mechanism but does not change live collection behavior unless
+    # explicitly enabled. quota_pct_cap is the hard ceiling (see prompt:
+    # "do not exceed 60% of documented hourly quota by design").
+    densified_polling_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    densified_polling_quota_pct_cap: Mapped[float] = mapped_column(Float, default=60.0)
+    densified_polling_hourly_quota_cap: Mapped[int] = mapped_column(Integer, default=3600)
     # D22/D23: widened from 3->5 leagues after real BetsAPI data proved two
     # things wrong in D20/D17: (1) country-vs-club team skin does NOT predict
     # league -- H2H GG League and Adriatic League each mix both formats, so
@@ -378,6 +404,103 @@ class RawProviderResponse(Base):
     # column existed). Lets performance/health reporting break calls and
     # empty-response rate down per sportsbook.
     sportsbook: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    # v0.3.7B: link back to the PollCycle that produced this response, and
+    # (best-effort, may stay null for bulk/multi-event endpoints) the
+    # specific provider event id this call was about.
+    poll_cycle_id: Mapped[int | None] = mapped_column(ForeignKey("poll_cycles.id"), nullable=True)
+    provider_event_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+
+
+class PollCycle(Base):
+    """v0.3.7B: one row per outbound provider HTTP call. True system-clock
+    instrumentation for poll density, cadence, and quota tracking, separate
+    from OddsSnapshot.collected_at (provider event-time -- see v0.3.7A
+    Gate G1). Additive, new table; never touches historical rows."""
+    __tablename__ = "poll_cycles"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    endpoint: Mapped[str] = mapped_column(String(200))
+    provider: Mapped[str] = mapped_column(String(40))
+    intended_poll_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    poll_started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    response_received_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    success: Mapped[bool] = mapped_column(Boolean, default=False)
+    error_type: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    request_duration_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    events_requested_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    odds_rows_written_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    raw_payload_empty: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    quota_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quota_remaining: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quota_reset_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    rate_limited: Mapped[bool] = mapped_column(Boolean, default=False)
+    notes: Mapped[str] = mapped_column(Text, default="")
+
+
+class MarketAvailabilityRecord(Base):
+    """v0.3.7B: heartbeat row written every poll cycle, even when odds are
+    UNCHANGED. Pure change-only storage (the existing OddsSnapshot /
+    MarketEvent 'disappeared' pattern) cannot distinguish 'we stopped
+    polling' from 'the market genuinely vanished' -- this table exists
+    specifically to close that gap so availability-state detection is
+    possible going forward. See notes/triage/v0_3_7B-market-availability.md."""
+    __tablename__ = "market_availability_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    match_id: Mapped[int | None] = mapped_column(ForeignKey("matches.id"), nullable=True, index=True)
+    sportsbook: Mapped[str] = mapped_column(String(60), default="")
+    market: Mapped[str] = mapped_column(String(30), default="")
+    selection: Mapped[str] = mapped_column(String(30), default="")
+    poll_cycle_id: Mapped[int | None] = mapped_column(ForeignKey("poll_cycles.id"), nullable=True)
+    source_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    availability_state: Mapped[str] = mapped_column(String(40), default="UNKNOWN")
+    odds_changed: Mapped[bool] = mapped_column(Boolean, default=False)
+    decimal_odds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    seconds_to_kickoff: Mapped[float | None] = mapped_column(Float, nullable=True)
+    notes: Mapped[str] = mapped_column(Text, default="")
+
+
+class ExecutionClassification(Base):
+    """v0.3.7B execution classifier v2: one primary state + coexisting
+    diagnostic flags per PaperTrade row. Additive/report table -- never
+    mutates PaperTrade.settlement_status. Historical rows (no system
+    timestamps available) are always is_historical_degraded=True."""
+    __tablename__ = "execution_classifications"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    paper_trade_id: Mapped[int] = mapped_column(ForeignKey("paper_trades.id"), index=True, unique=True)
+    computed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    primary_state: Mapped[str] = mapped_column(String(40))
+    diagnostic_flags_json: Mapped[str] = mapped_column(Text, default="[]")
+    is_historical_degraded: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class ClosingRecord(Base):
+    """v0.3.7B: one row per (match, book, market, selection) closing-price
+    determination, going forward. Additive, new table. Never imputes a
+    close; never devigs an incomplete 3-way market (all_three_outcomes_present
+    must be True before any downstream devig is attempted)."""
+    __tablename__ = "closing_records"
+    __table_args__ = (UniqueConstraint("match_id", "sportsbook", "market", "selection"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    match_id: Mapped[int] = mapped_column(ForeignKey("matches.id"), index=True)
+    provider_event_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    sportsbook: Mapped[str] = mapped_column(String(60), default="")
+    market: Mapped[str] = mapped_column(String(30), default="")
+    selection: Mapped[str] = mapped_column(String(30), default="")
+    close_source_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    close_polled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    close_ingested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    close_price_decimal: Mapped[float | None] = mapped_column(Float, nullable=True)
+    close_american: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    close_type: Mapped[str] = mapped_column(String(30), default="LAST_AVAILABLE")
+    close_quality: Mapped[str] = mapped_column(String(10), default="INVALID")
+    all_three_outcomes_present: Mapped[bool] = mapped_column(Boolean, default=False)
+    updates_final_5m_count: Mapped[int] = mapped_column(Integer, default=0)
+    updates_between_entry_and_close_count: Mapped[int] = mapped_column(Integer, default=0)
+    market_available_at_close: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    flags_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 

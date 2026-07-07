@@ -19,7 +19,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import RawProviderResponse
+from ..models import PollCycle, RawProviderResponse
 
 BASE = "https://api.b365api.com"
 SPORT_ID_SOCCER = 1
@@ -38,6 +38,13 @@ class BetsApiProvider:
                                   # live budget from X-RateLimit-* response headers
                                   "quota_limit": None, "quota_remaining": None,
                                   "quota_resets_at": None}
+        # v0.3.7B: true system-clock timing for the most recent _get() call,
+        # so callers (fetch_odds) can attach real poll/response timestamps to
+        # each row instead of only the provider's own event time. Naive UTC
+        # (matches this codebase's _now() convention throughout).
+        self.last_poll_cycle_id: int | None = None
+        self.last_polled_at: datetime | None = None
+        self.last_response_received_at: datetime | None = None
 
     # ------------------------------------------------------------------ core
     def _get(self, path: str, params: dict, max_retries: int = 3, sportsbook: str | None = None) -> dict | None:
@@ -47,8 +54,12 @@ class BetsApiProvider:
         params = {**params, "token": self.token}
         backoff = 1.0
         for attempt in range(max_retries + 1):
+            polled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            t0 = time.monotonic()
             try:
                 r = httpx.get(f"{BASE}{path}", params=params, timeout=10)
+                response_received_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                duration_ms = round((time.monotonic() - t0) * 1000, 1)
                 self.last_status.update(last_call=datetime.now(timezone.utc).isoformat(),
                                         last_code=r.status_code)
                 self.last_status["calls"] += 1
@@ -62,8 +73,12 @@ class BetsApiProvider:
                 if h.get("X-RateLimit-Reset"):
                     self.last_status["quota_resets_at"] = datetime.fromtimestamp(
                         int(h["X-RateLimit-Reset"]), tz=timezone.utc).isoformat()
+                rate_limited = r.status_code == 429
+                self._record_poll_cycle(path, polled_at, response_received_at, r.status_code,
+                                        duration_ms, success=r.status_code < 300,
+                                        rate_limited=rate_limited)
                 self._store_raw(path, r.status_code, r.text, sportsbook=sportsbook)
-                if r.status_code == 429:            # rate limited
+                if rate_limited:            # rate limited
                     self.last_status["rate_limited"] += 1
                     time.sleep(backoff)
                     backoff *= 2
@@ -80,7 +95,11 @@ class BetsApiProvider:
                     self.last_status["empty_responses"] += 1
                     return {"results": []}
                 return data
-            except (httpx.HTTPError, json.JSONDecodeError):
+            except (httpx.HTTPError, json.JSONDecodeError) as e:
+                response_received_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                duration_ms = round((time.monotonic() - t0) * 1000, 1)
+                self._record_poll_cycle(path, polled_at, response_received_at, None, duration_ms,
+                                        success=False, error_type=type(e).__name__)
                 if attempt == max_retries:
                     return None
                 time.sleep(backoff)
@@ -88,13 +107,44 @@ class BetsApiProvider:
                 self.last_status["retries"] += 1
         return None
 
+    def _record_poll_cycle(self, endpoint: str, polled_at: datetime, response_received_at: datetime,
+                           status_code: int | None, duration_ms: float, success: bool,
+                           error_type: str | None = None, rate_limited: bool = False):
+        """v0.3.7B: true system-clock record of this HTTP call, independent of
+        provider event-time. self.last_poll_cycle_id/last_polled_at/
+        last_response_received_at are set even if self.db is None (tests /
+        no-DB callers), just not persisted."""
+        self.last_polled_at = polled_at
+        self.last_response_received_at = response_received_at
+        self.last_poll_cycle_id = None
+        if self.db is None:
+            return
+        try:
+            row = PollCycle(
+                endpoint=endpoint, provider=self.name, intended_poll_at=polled_at,
+                poll_started_at=polled_at, response_received_at=response_received_at,
+                committed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                status_code=status_code, success=success, error_type=error_type,
+                request_duration_ms=duration_ms,
+                quota_limit=self.last_status.get("quota_limit"),
+                quota_remaining=self.last_status.get("quota_remaining"),
+                quota_reset_at=self.last_status.get("quota_resets_at"),
+                rate_limited=rate_limited,
+            )
+            self.db.add(row)
+            self.db.commit()
+            self.last_poll_cycle_id = row.id
+        except Exception:
+            self.db.rollback()
+
     def _store_raw(self, endpoint: str, code: int, payload: str, sportsbook: str | None = None):
         if self.db is None:
             return
         try:
             self.db.add(RawProviderResponse(provider=self.name, endpoint=endpoint,
                                             status_code=code, payload=payload[:200_000],
-                                            sportsbook=sportsbook))
+                                            sportsbook=sportsbook,
+                                            poll_cycle_id=self.last_poll_cycle_id))
             self.db.commit()
         except Exception:
             self.db.rollback()
@@ -192,6 +242,13 @@ class BetsApiProvider:
         data = self._get("/v2/event/odds",
                          {"event_id": event_id, "source": source, "odds_market": "1,2"},
                          sportsbook=source)
+        # v0.3.7B: capture this call's true system-clock timing once, up
+        # front, so every row from this fetch carries the SAME polled_at/
+        # response_received_at/poll_cycle_id -- they describe the HTTP call,
+        # not the individual tick.
+        polled_at = self.last_polled_at
+        response_received_at = self.last_response_received_at
+        poll_cycle_id = self.last_poll_cycle_id
         if not data:
             return []
         out = []
@@ -205,15 +262,24 @@ class BetsApiProvider:
                 if not dec or dec in ("-",):
                     continue
                 dec = float(dec)
+                source_ts = (datetime.fromtimestamp(int(tick["add_time"]), tz=timezone.utc)
+                            .replace(tzinfo=None) if tick.get("add_time") else now)
                 out.append({
                     "ext_id": str(event_id), "sportsbook": source,
                     "market": "ML_3WAY", "selection": sel, "line": None,
                     "decimal_odds": dec,
                     "american_odds": _dec_to_american(dec),
                     "implied_prob": round(1 / dec, 4),
-                    "collected_at": datetime.fromtimestamp(int(tick["add_time"]), tz=timezone.utc)
-                                    .replace(tzinfo=None) if tick.get("add_time") else now,
+                    "collected_at": source_ts,
                     "is_opening": False, "is_closing": False,
+                    # v0.3.7B: true system-observation fields. source_ts is a
+                    # same-value alias for collected_at (which remains
+                    # provider event-time, unchanged); polled_at/
+                    # response_received_at are our own wall clock.
+                    "source_ts": source_ts, "polled_at": polled_at,
+                    "response_received_at": response_received_at,
+                    "poll_cycle_id": poll_cycle_id, "provider_event_id": str(event_id),
+                    "provider_book": source,
                 })
 
         # market 1_2 = Asian Handicap (spread). FIELD NAMES UNVERIFIED --
@@ -234,15 +300,20 @@ class BetsApiProvider:
                     continue
                 if line_f > -0.5:  # rule: spread only up to -0.5 (D-earlier)
                     continue
+                source_ts = (datetime.fromtimestamp(int(tick["add_time"]), tz=timezone.utc)
+                            .replace(tzinfo=None) if tick.get("add_time") else now)
                 out.append({
                     "ext_id": str(event_id), "sportsbook": source,
                     "market": "SPREAD_2WAY", "selection": sel, "line": line_f,
                     "decimal_odds": dec,
                     "american_odds": _dec_to_american(dec),
                     "implied_prob": round(1 / dec, 4),
-                    "collected_at": datetime.fromtimestamp(int(tick["add_time"]), tz=timezone.utc)
-                                    .replace(tzinfo=None) if tick.get("add_time") else now,
+                    "collected_at": source_ts,
                     "is_opening": False, "is_closing": False,
+                    "source_ts": source_ts, "polled_at": polled_at,
+                    "response_received_at": response_received_at,
+                    "poll_cycle_id": poll_cycle_id, "provider_event_id": str(event_id),
+                    "provider_book": source,
                 })
         return out
 

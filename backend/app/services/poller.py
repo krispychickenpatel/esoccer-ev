@@ -35,6 +35,8 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 
 from ..database import SessionLocal
+from ..engines import poll_scheduler
+from ..engines.market_availability import write_heartbeat
 from ..models import (Match, MarketEvent, OddsSnapshot, PredictionLedger,
                       PredictionReality, RawProviderResponse, Recommendation,
                       Settings)
@@ -78,6 +80,11 @@ _LAST_FRIEND_RESOLVE: datetime | None = None
 # (see _match_priority) decides who gets the slots first, so a large tracked
 # set can never starve a match that just went live.
 MAX_MATCHES_PER_TICK = 60
+
+# v0.3.7B: circuit breaker for densified polling only (Settings.
+# densified_polling_enabled, default False). Does not affect normal-cadence
+# polling at all.
+_CIRCUIT_BREAKER = poll_scheduler.CircuitBreakerState()
 
 
 def cadence_seconds(s2k: float) -> float:
@@ -127,9 +134,17 @@ def _match_priority(m: Match, now: datetime, live_missing_first_live: set[int]) 
     return (tier, abs(s2k))
 
 
-def process_snapshots(db, match: Match, incoming: list[dict]) -> dict:
+def process_snapshots(db, match: Match, incoming: list[dict], *, sportsbook: str | None = None,
+                      tracked_markets: list[str] | None = None) -> dict:
     """Store snapshots + emit MarketEvents. Pure function of (prev state, tick) —
-    unit-testable without a live provider."""
+    unit-testable without a live provider.
+
+    v0.3.7B: also writes a MarketAvailabilityRecord heartbeat for every
+    tracked (sportsbook, market, selection) combo on THIS call, even when
+    incoming is empty -- pure change-only snapshot storage cannot tell
+    "market genuinely absent" apart from "we didn't poll." sportsbook must
+    be passed explicitly when incoming may be empty (there's no tick to
+    infer it from)."""
     now = _now()
     written = events = 0
     prev = {}
@@ -159,7 +174,17 @@ def process_snapshots(db, match: Match, incoming: list[dict]) -> dict:
                             collected_at=o["collected_at"], phase=phase,
                             seconds_to_kickoff=round(s2k, 1),
                             is_opening=p is None, is_closing=False,
-                            data_source="betsapi", verification_status="api_verified")
+                            data_source="betsapi", verification_status="api_verified",
+                            # v0.3.7B true system-observation fields (all
+                            # optional-in-payload for backward compat with
+                            # older/test callers that don't set them).
+                            source_ts=o.get("source_ts", o["collected_at"]),
+                            polled_at=o.get("polled_at"),
+                            response_received_at=o.get("response_received_at"),
+                            ingested_at=now, poll_cycle_id=o.get("poll_cycle_id"),
+                            provider_event_id=o.get("provider_event_id"),
+                            provider_book=o.get("provider_book", o["sportsbook"]),
+                            market_available=True, availability_state="PRESENT")
         db.add(snap)
         existing_ticks.add(tick_key)
         written += 1
@@ -200,6 +225,26 @@ def process_snapshots(db, match: Match, incoming: list[dict]) -> dict:
                                detail_json="{}", at=now))
             events += 1
     db.commit()
+
+    # v0.3.7B heartbeat: write availability records for the tracked markets
+    # of THIS sportsbook, whether or not any odds changed. Written every
+    # call, which is a superset of (never coarser than) the "at least every
+    # 60s" requirement -- this is DB-only, no extra API calls, so there's no
+    # quota cost to writing it more often than the floor.
+    book = sportsbook or (incoming[0]["sportsbook"] if incoming else None)
+    if book:
+        for market in (tracked_markets or ["ML_3WAY"]):
+            sels = ("home", "draw", "away") if market == "ML_3WAY" else ("home", "away")
+            present = {o["selection"] for o in incoming if o["market"] == market}
+            dec_by_sel = {o["selection"]: o["decimal_odds"] for o in incoming if o["market"] == market}
+            poll_cycle_id = next((o.get("poll_cycle_id") for o in incoming if o["market"] == market), None)
+            source_ts = next((o.get("source_ts") for o in incoming if o["market"] == market), None)
+            write_heartbeat(db, match=match, sportsbook=book, market=market,
+                            selections_present=present, all_selections_tracked=sels,
+                            call_succeeded=True, payload_totally_empty=(len(incoming) == 0),
+                            poll_cycle_id=poll_cycle_id, source_ts=source_ts, observed_at=now,
+                            decimal_odds_by_selection=dec_by_sel)
+
     return {"written": written, "events": events}
 
 
@@ -433,11 +478,42 @@ async def poll_loop(provider_factory):
                     min_wait = 30.0
                 polled_this_tick = 0
                 books = json.loads(s.sportsbooks_tracked or "[]") or ["bet365"]
+                markets_list = json.loads(s.markets_tracked or "[]") or ["ML_3WAY"]
+
+                # v0.3.7B: densified near-kickoff polling, OFF by default
+                # (Settings.densified_polling_enabled). When on, only
+                # overrides cadence for matches inside the T-10min..live+2min
+                # window and only while the circuit breaker is closed and
+                # quota usage stays under the configured pct cap -- outside
+                # those conditions, behavior is identical to before this
+                # release.
+                densified_on = bool(getattr(s, "densified_polling_enabled", False))
+                quota_pressure = None
+                if densified_on:
+                    one_hour_ago = now - timedelta(hours=1)
+                    calls_last_hour = db.scalar(select(func.count(RawProviderResponse.id)).where(
+                        RawProviderResponse.at >= one_hour_ago)) or 0
+                    quota_pressure = poll_scheduler.quota_pressure_pct(
+                        calls_last_hour, s.densified_polling_hourly_quota_cap)
+                    STATUS["densified_polling"] = {
+                        "enabled": True, "quota_pressure_pct": quota_pressure,
+                        "circuit_breaker_open": _CIRCUIT_BREAKER.is_open(now),
+                        "trip_count": _CIRCUIT_BREAKER.trip_count,
+                    }
+
                 for m in window:
                     if polled_this_tick >= MAX_MATCHES_PER_TICK:
                         break  # hard cap: lower-priority matches wait for the next tick
                     s2k = (m.start_time - now).total_seconds()
-                    interval = cadence_seconds(s2k)
+                    if (densified_on and poll_scheduler.in_densified_window(s2k)
+                            and not _CIRCUIT_BREAKER.is_open(now)
+                            and poll_scheduler.quota_budget_ok(
+                                calls_last_hour, s.densified_polling_hourly_quota_cap,
+                                s.densified_polling_quota_pct_cap)):
+                        interval = poll_scheduler.densified_cadence_seconds(
+                            quota_pressure, s.densified_polling_quota_pct_cap)
+                    else:
+                        interval = cadence_seconds(s2k)
                     last = _LAST_POLLED.get(m.id)
                     due = last is None or (now - last).total_seconds() >= interval
                     if s2k > 600 and last is not None:
@@ -452,10 +528,23 @@ async def poll_loop(provider_factory):
                     # day) but never blocks bet365's own call from happening.
                     for book in books:
                         odds = provider.fetch_odds(m.ext_id, source=book)
-                        if odds:
-                            r = process_snapshots(db, m, odds)
-                            STATUS["snapshots_written"] += r["written"]
-                            STATUS["events_written"] += r["events"]
+                        # v0.3.7B: circuit breaker only matters for densified
+                        # polling; feeding it here (not just when densified_on)
+                        # means it's warm and accurate the moment someone
+                        # flips the setting on mid-session.
+                        last_code = provider.last_status.get("last_code")
+                        if last_code == 429 or (last_code is not None and last_code >= 500):
+                            _CIRCUIT_BREAKER.record_failure(now)
+                        else:
+                            _CIRCUIT_BREAKER.record_success()
+                        # v0.3.7B: always process, even when odds is empty --
+                        # heartbeat/availability records must be written on
+                        # every poll so "market genuinely absent" can be told
+                        # apart from "we didn't poll" later.
+                        r = process_snapshots(db, m, odds, sportsbook=book,
+                                              tracked_markets=markets_list)
+                        STATUS["snapshots_written"] += r["written"]
+                        STATUS["events_written"] += r["events"]
 
                 # v0.3.5: ended-results ingestion, throttled to once/45s so it
                 # never competes with the odds-polling loop above for a slot
