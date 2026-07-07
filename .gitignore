@@ -9,3 +9,29 @@ esoccer.db
 *.tsbuildinfo
 backend/*.log
 frontend/*.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Databases / backups
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+*.backup
+backups/
+backend/*.db
+backend/*.bak
+
+# Logs / runtime files
+logs/
+*.log
+
+# Node / Python junk
+node_modules/
+__pycache__/
+.pytest_cache/
+.venv/
+.DS_Store
