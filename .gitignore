@@ -17,6 +17,9 @@ frontend/*.log
 
 # Databases / backups
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 *.bak
@@ -28,6 +31,18 @@ backend/*.bak
 # Logs / runtime files
 logs/
 *.log
+
+# v0.3.7C: a filled-in launchd plist can contain BETSAPI_KEY -- only the
+# .template (placeholders only) is ever committed.
+*.plist
+!*.plist.template
+
+# Screenshots / recordings (manual spot-check evidence, never committed)
+*.png
+*.jpg
+*.jpeg
+*.mov
+*.mp4
 
 # Node / Python junk
 node_modules/

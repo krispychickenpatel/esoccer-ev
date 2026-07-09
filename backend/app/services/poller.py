@@ -36,6 +36,7 @@ from sqlalchemy import func, select
 
 from ..database import SessionLocal
 from ..engines import poll_scheduler
+from ..workday_config import load_workday_config
 from ..engines.market_availability import write_heartbeat
 from ..models import (Match, MarketEvent, OddsSnapshot, PredictionLedger,
                       PredictionReality, RawProviderResponse, Recommendation,
@@ -74,6 +75,11 @@ _LAST_RESULTS_INGEST: datetime | None = None
 # calls), so it's cheap enough to run frequently, but still throttled to
 # avoid doing it on every single tight-live-window tick.
 _LAST_FRIEND_RESOLVE: datetime | None = None
+
+# v0.3.7C: last time Auto Paper Simulation ran. DB-only, throttled to
+# once/15min (user-selected cadence).
+_LAST_AUTO_PAPER_SIM: datetime | None = None
+AUTO_PAPER_SIM_INTERVAL_S = 900.0
 
 # v0.3.5: hard cap on how many matches get an actual fetch_odds() call in one
 # tick, regardless of how many are in the tracked window. Priority order
@@ -360,6 +366,30 @@ async def poll_loop(provider_factory):
                     STATUS["note"] = "poller disabled in settings"
                     await asyncio.sleep(10)
                     continue
+
+                # v0.3.7C: Workday Autopilot bounded runtime -- a safety net
+                # independent of anyone remembering to manually flip
+                # poller_enabled back off. Checked every tick, right after
+                # confirming the poller is even meant to be on.
+                if s.autopilot_max_runtime_minutes and s.autopilot_started_at:
+                    elapsed_min = (_now() - s.autopilot_started_at).total_seconds() / 60.0
+                    if elapsed_min >= s.autopilot_max_runtime_minutes:
+                        s.poller_enabled = False
+                        cap = s.autopilot_max_runtime_minutes
+                        # Clear the run's own bookkeeping too -- leaving
+                        # autopilot_started_at set makes every later status
+                        # check report a growing, increasingly nonsensical
+                        # "elapsed_minutes"/negative "minutes_remaining" for
+                        # a run that already finished.
+                        s.autopilot_started_at = None
+                        s.autopilot_max_runtime_minutes = None
+                        db.commit()
+                        STATUS["note"] = (f"autopilot auto-disabled: ran {round(elapsed_min, 1)}min, "
+                                          f"cap was {cap}min")
+                        STATUS["autopilot_auto_disabled_at"] = _now().isoformat()
+                        await asyncio.sleep(10)
+                        continue
+
                 provider = provider_factory(db)
                 STATUS["provider"] = provider.name
                 if not getattr(provider, "token", ""):
@@ -378,6 +408,12 @@ async def poll_loop(provider_factory):
                     await asyncio.sleep(60)
                     continue
                 now = _now()
+                workday_cfg = load_workday_config()
+                if not workday_cfg.in_collection_window(now):
+                    STATUS["note"] = ("outside configured WORKDAY_COLLECTION_START/END window "
+                                      "-- idling without spending API quota")
+                    await asyncio.sleep(30)
+                    continue
                 tracked = json.loads(s.tracked_leagues or "[]")
                 if not tracked:
                     STATUS["note"] = ("poller enabled but tracked_leagues is empty in "
@@ -487,7 +523,13 @@ async def poll_loop(provider_factory):
                 # quota usage stays under the configured pct cap -- outside
                 # those conditions, behavior is identical to before this
                 # release.
-                densified_on = bool(getattr(s, "densified_polling_enabled", False))
+                # v0.3.7C: requires BOTH the Settings toggle AND the
+                # WORKDAY_ENABLE_DENSIFIED_POLLING env var -- the env var is
+                # an extra, explicit operational gate specifically for
+                # workday-autopilot deployments (default false; must be
+                # deliberately set, not just flipped in Settings via the API).
+                densified_on = (bool(getattr(s, "densified_polling_enabled", False))
+                               and workday_cfg.enable_densified_polling)
                 quota_pressure = None
                 if densified_on:
                     one_hour_ago = now - timedelta(hours=1)
@@ -597,6 +639,32 @@ async def poll_loop(provider_factory):
                         STATUS["friend_pick_resolution_error"] = str(e)
                     finally:
                         _LAST_FRIEND_RESOLVE = now
+
+                # v0.3.7C: Auto Paper Simulation -- DB-only, no API calls,
+                # throttled to once/15min so it never competes with odds
+                # polling for tick time. Runs the SAME idempotent engine
+                # functions used manually in v0.3.6.2/v0.3.7B (simulate_all,
+                # classify_all, build_all) -- no new gating logic, this just
+                # keeps forward data flowing into the existing sample-size-
+                # gated reports automatically.
+                global _LAST_AUTO_PAPER_SIM
+                auto_sim_due = (_LAST_AUTO_PAPER_SIM is None
+                               or (now - _LAST_AUTO_PAPER_SIM).total_seconds() >= AUTO_PAPER_SIM_INTERVAL_S)
+                if auto_sim_due:
+                    try:
+                        from ..engines.paper_trade import simulate_all
+                        from ..engines.execution_classifier_v2 import classify_all
+                        from ..engines.closing_records import build_all
+                        STATUS["auto_paper_sim"] = {
+                            "at": now.isoformat(),
+                            "simulate_all": simulate_all(db),
+                            "classify_all": classify_all(db),
+                            "closing_records": build_all(db),
+                        }
+                    except Exception as e:  # poller must keep collecting odds even if this fails
+                        STATUS["auto_paper_sim_error"] = str(e)
+                    finally:
+                        _LAST_AUTO_PAPER_SIM = now
 
                 # prune matches that dropped out of the tracking window
                 for mid in list(_LAST_POLLED):

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+v0.3.7C launchd TEMPLATE. This is NOT installed automatically by any script
+in this repo -- copy, edit, and load it yourself (see docs/WORKDAY_AUTOPILOT.md
+for exact commands). Replace every <<PLACEHOLDER>> before use.
+
+This does NOT set BETSAPI_KEY here -- launchd jobs do not inherit your shell
+profile, so you must add an <EnvironmentVariables> block yourself with the
+key, or (safer) source it from a file launchd can read that is NOT this repo
+and NOT committed anywhere.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.esoccer.workday-autopilot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string><<PATH_TO_PYTHON3>></string>
+        <string><<REPO_DIR>>/scripts/ops/run_workday_autopilot.py</string>
+        <string>--max-minutes</string>
+        <string><<MAX_MINUTES_E_G_480>></string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string><<REPO_DIR>></string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BETSAPI_KEY</key>
+        <string><<YOUR_KEY_HERE_NEVER_COMMIT_THIS_FILE_ONCE_FILLED_IN>></string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string><<REPO_DIR>>/logs/workday/launchd-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string><<REPO_DIR>>/logs/workday/launchd-stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>

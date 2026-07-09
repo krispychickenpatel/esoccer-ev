@@ -213,6 +213,15 @@ class Settings(Base):
     densified_polling_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     densified_polling_quota_pct_cap: Mapped[float] = mapped_column(Float, default=60.0)
     densified_polling_hourly_quota_cap: Mapped[int] = mapped_column(Integer, default=3600)
+    # v0.3.7C: Workday Autopilot bounded runtime. autopilot_started_at is set
+    # by scripts/autopilot_control.py when a supervised/unattended run
+    # begins; poll_loop auto-disables poller_enabled once
+    # autopilot_max_runtime_minutes has elapsed -- a belt-and-suspenders
+    # safety net independent of anyone remembering to turn it off manually.
+    # NULL max_runtime = no cap (ordinary manual poller_enabled behavior,
+    # unchanged from before this release).
+    autopilot_max_runtime_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    autopilot_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # D22/D23: widened from 3->5 leagues after real BetsAPI data proved two
     # things wrong in D20/D17: (1) country-vs-club team skin does NOT predict
     # league -- H2H GG League and Adriatic League each mix both formats, so
