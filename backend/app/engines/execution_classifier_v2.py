@@ -1,4 +1,4 @@
-"""Execution classification v2 (v0.3.7B Section 4).
+"""Execution classification v2 (v0.3.7B Section 4, v0.3.7D timing fix).
 
 Replaces the old single "missed price" idea with one primary execution
 state plus multiple coexisting diagnostic flags, computed per PaperTrade
@@ -10,6 +10,15 @@ breach -- NO_DATA_AT_ENTRY must be the dominant state reported, not
 PRICE_BELOW_ENTRY_FLOOR. maximum_entry_decimal is a misleading legacy name
 for a MINIMUM acceptable entry floor; this module never uses the phrase
 "moved past max entry" -- see PRICE_BELOW_ENTRY_FLOOR.
+
+v0.3.7D fix (notes/triage/v0_3_7D-signal-timing-audit.md): SIGNAL_TOO_LATE
+used to compare prediction_time against Match.start_time (the nominal/
+scheduled kickoff). Real data showed 29 of 32 audited matches had their
+actual observed live-phase start 7-60s (mean 29s) AFTER Match.start_time --
+so a prediction frozen shortly after the SCHEDULED time but still before
+the TRUE kickoff was being mislabeled as too late. Fixed to compare against
+actual/live start (earliest phase='live' OddsSnapshot) when available,
+falling back to scheduled start only when no live data exists yet.
 """
 from __future__ import annotations
 
@@ -21,6 +30,7 @@ from sqlalchemy.orm import Session
 
 from ..models import (ExecutionClassification, Match, MarketAvailabilityRecord,
                       OddsSnapshot, PaperTrade, PredictionLedger)
+from .closing_records import _actual_start
 from .market_availability import ABSENT, BOOK_MISSING_MARKET, EMPTY_PROVIDER_RESPONSE, \
     detect_withdrawal_relist_candidates
 
@@ -33,8 +43,34 @@ SIGNAL_TOO_LATE = "SIGNAL_TOO_LATE"
 TIMESTAMP_UNTRUSTWORTHY = "TIMESTAMP_UNTRUSTWORTHY"
 UNKNOWN = "UNKNOWN"
 
+# v0.3.7D executable-signal gate (Section 3) -- orthogonal to primary_state.
+EXECUTABLE_PREKICK = "EXECUTABLE_PREKICK"
+RESEARCH_ONLY_KICKOFF = "RESEARCH_ONLY_KICKOFF"
+LATE_SIGNAL = "LATE_SIGNAL"
+UNKNOWN_START_TIME = "UNKNOWN_START_TIME"
+MINIMUM_USEFUL_LEAD_SECONDS = 20.0
+
 STALE_THRESHOLD_S = 60.0
 HISTORICAL_CREATED_AT_GAP_S = 300.0  # 5 min: created_at far from signal_time -> backfill artifact
+
+
+def compute_executability(db: Session, pred: PredictionLedger | None, match: Match | None,
+                         min_lead_s: float = MINIMUM_USEFUL_LEAD_SECONDS) -> str:
+    """A signal is executable only if
+    prediction_time <= actual_start_or_scheduled_start - min_lead_s.
+    Orthogonal to primary_state: a row can be e.g. NO_DATA_AT_ENTRY AND
+    EXECUTABLE_PREKICK at the same time (a genuinely timely signal that
+    simply had no odds row at the target delay)."""
+    if pred is None or match is None or match.start_time is None:
+        return UNKNOWN_START_TIME
+    actual_start, _used_fallback = _actual_start(db, match)
+    if actual_start is None:
+        return UNKNOWN_START_TIME
+    if pred.prediction_time <= actual_start - timedelta(seconds=min_lead_s):
+        return EXECUTABLE_PREKICK
+    if pred.horizon_label == "KICKOFF":
+        return RESEARCH_ONLY_KICKOFF
+    return LATE_SIGNAL
 
 
 def _nearby_availability_state(db: Session, match_id: int, sportsbook: str, market: str,
@@ -48,8 +84,8 @@ def _nearby_availability_state(db: Session, match_id: int, sportsbook: str, mark
     return rows[0].availability_state if rows else None
 
 
-def classify_paper_trade(db: Session, trade: PaperTrade) -> tuple[str, list[str], bool]:
-    """Returns (primary_state, diagnostic_flags, is_historical_degraded)."""
+def classify_paper_trade(db: Session, trade: PaperTrade) -> tuple[str, list[str], bool, str]:
+    """Returns (primary_state, diagnostic_flags, is_historical_degraded, executability_label)."""
     flags: set[str] = set()
 
     pred = None
@@ -69,11 +105,21 @@ def classify_paper_trade(db: Session, trade: PaperTrade) -> tuple[str, list[str]
         if gap_ref is not None and abs(gap_ref.total_seconds()) > HISTORICAL_CREATED_AT_GAP_S:
             flags.add("historical_created_at_not_event_time")
 
-    # signal-too-late check, independent of price outcome
+    match = db.get(Match, trade.match_id) if trade.match_id else None
+
+    # signal-too-late check, independent of price outcome. v0.3.7D fix:
+    # compare against actual/live start (from closing_records._actual_start,
+    # the same earliest-phase='live'-odds-row convention used everywhere
+    # else in this codebase), not Match.start_time directly -- real matches
+    # were observed starting 7-60s (mean 29s) after their nominal
+    # scheduled time, so using scheduled time alone mislabeled genuinely
+    # pre-kickoff signals as too late.
     signal_too_late = False
-    if pred is not None and pred.horizon_label == "KICKOFF":
-        match = db.get(Match, trade.match_id) if trade.match_id else None
-        if match is not None and pred.prediction_time >= match.start_time:
+    executability = UNKNOWN_START_TIME
+    if pred is not None and match is not None and match.start_time is not None:
+        executability = compute_executability(db, pred, match)
+        actual_start, _ = _actual_start(db, match)
+        if actual_start is not None and pred.prediction_time >= actual_start:
             signal_too_late = True
 
     # odds-history sufficiency (reuses the >=2-updates convention from
@@ -118,7 +164,6 @@ def classify_paper_trade(db: Session, trade: PaperTrade) -> tuple[str, list[str]
     # market-withdrawal candidate flags (forward data only -- historical
     # rows have no MarketAvailabilityRecord history and will simply not set
     # these, which is honest, not a bug)
-    match = db.get(Match, trade.match_id) if trade.match_id else None
     if match is not None:
         candidate = detect_withdrawal_relist_candidates(
             db, match, trade.sportsbook, trade.market, trade.selection)
@@ -163,17 +208,18 @@ def classify_paper_trade(db: Session, trade: PaperTrade) -> tuple[str, list[str]
     else:
         primary = UNKNOWN
 
-    return primary, sorted(flags), is_historical_degraded
+    return primary, sorted(flags), is_historical_degraded, executability
 
 
 def classify_and_store(db: Session, trade: PaperTrade) -> ExecutionClassification:
-    primary, flags, degraded = classify_paper_trade(db, trade)
+    primary, flags, degraded, executability = classify_paper_trade(db, trade)
     existing = db.scalar(select(ExecutionClassification).where(
         ExecutionClassification.paper_trade_id == trade.id))
     row = existing or ExecutionClassification(paper_trade_id=trade.id)
     row.primary_state = primary
     row.diagnostic_flags_json = json.dumps(flags)
     row.is_historical_degraded = degraded
+    row.executability_label = executability
     if existing is None:
         db.add(row)
     db.commit()
@@ -186,15 +232,18 @@ def classify_all(db: Session) -> dict:
     place rather than duplicating (unique constraint on paper_trade_id)."""
     trades = db.scalars(select(PaperTrade)).all()
     by_primary: dict[str, int] = {}
+    by_executability: dict[str, int] = {}
     degraded_count = 0
     for t in trades:
         row = classify_and_store(db, t)
         by_primary[row.primary_state] = by_primary.get(row.primary_state, 0) + 1
+        by_executability[row.executability_label] = by_executability.get(row.executability_label, 0) + 1
         if row.is_historical_degraded:
             degraded_count += 1
     return {
         "total_classified": len(trades),
         "by_primary_state": by_primary,
+        "by_executability": by_executability,
         "historical_degraded_count": degraded_count,
         "forward_trustworthy_count": len(trades) - degraded_count,
     }

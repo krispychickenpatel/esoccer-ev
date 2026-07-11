@@ -53,7 +53,7 @@ def test_no_data_at_entry_is_primary_when_no_snapshot_exists():
     pred = _pred(db, m)
     paper_trade.simulate_model_candidate(db, pred.id)
     trade = db.scalars(select(PaperTrade).where(PaperTrade.delay_seconds == 0)).first()
-    primary, flags, degraded = ecv2.classify_paper_trade(db, trade)
+    primary, flags, degraded, executability = ecv2.classify_paper_trade(db, trade)
     assert primary == ecv2.NO_DATA_AT_ENTRY
     assert degraded is True  # no OddsSnapshot at all behind this trade
 
@@ -72,7 +72,7 @@ def test_price_below_entry_floor_not_moved_past_max_entry_wording():
     db.commit()
     paper_trade.simulate_model_candidate(db, pred.id)
     trade = db.scalars(select(PaperTrade).where(PaperTrade.delay_seconds == 0)).first()
-    primary, flags, degraded = ecv2.classify_paper_trade(db, trade)
+    primary, flags, degraded, executability = ecv2.classify_paper_trade(db, trade)
     assert primary == ecv2.PRICE_BELOW_ENTRY_FLOOR
     assert primary != "MOVED_PAST_MAX_ENTRY"
     assert "MOVED_PAST_MAX_ENTRY" not in dir(ecv2)
@@ -93,7 +93,7 @@ def test_primary_state_and_diagnostic_flags_coexist():
     db.commit()
     paper_trade.simulate_model_candidate(db, pred.id)
     trade = db.scalars(select(PaperTrade).where(PaperTrade.delay_seconds == 0)).first()
-    primary, flags, degraded = ecv2.classify_paper_trade(db, trade)
+    primary, flags, degraded, executability = ecv2.classify_paper_trade(db, trade)
     assert primary in (ecv2.FILLED,)
     assert "floor_equals_signal_price" in flags
     assert "no_discount_applied" in flags

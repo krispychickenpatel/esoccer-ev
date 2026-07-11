@@ -106,10 +106,19 @@ def section_b_execution_learning(db) -> dict:
     for r in rows:
         for f in json.loads(r.diagnostic_flags_json or "[]"):
             flag_counts[f] = flag_counts.get(f, 0) + 1
-    return {"by_primary_state": result["by_primary_state"], "diagnostic_flag_counts": flag_counts,
+    # v0.3.7D: forward-only executability breakdown, so downstream reporting
+    # can tell "forward sample exists but is 100% non-executable" apart from
+    # "forward sample exists and some of it is genuinely pre-kickoff."
+    forward_rows = [r for r in rows if not r.is_historical_degraded]
+    forward_executable_n = sum(1 for r in forward_rows
+                               if r.executability_label == execution_classifier_v2.EXECUTABLE_PREKICK)
+    return {"by_primary_state": result["by_primary_state"],
+           "by_executability": result.get("by_executability", {}),
+           "diagnostic_flag_counts": flag_counts,
            "total_classified": result["total_classified"],
            "historical_degraded_count": result["historical_degraded_count"],
-           "forward_trustworthy_count": result["forward_trustworthy_count"]}
+           "forward_trustworthy_count": result["forward_trustworthy_count"],
+           "forward_executable_count": forward_executable_n}
 
 
 # --------------------------------------------------------------- section C
@@ -327,10 +336,20 @@ def self_challenge(a, b, c, d) -> dict:
     }
 
 
-def final_recommendation(a, health_status: str) -> str:
-    """Exactly one action, priority-ordered."""
+def final_recommendation(a, health_status: str, b: dict | None = None) -> str:
+    """Exactly one action, priority-ordered.
+
+    v0.3.7D: a forward-trustworthy sample that exists but is entirely
+    non-executable (see notes/triage/v0_3_7D-signal-timing-audit.md) means
+    "collect more data" would just accumulate more of the same
+    non-executable KICKOFF-only signals -- the real next action is fixing
+    signal timing / running a full workday collection that starts well
+    before match windows, not simply waiting longer. Checked before the
+    generic BLOCKED/collect-more-data fallbacks."""
     if health_status in ("FAIL",):
         return "fix feed/polling"
+    if b is not None and b.get("forward_trustworthy_count", 0) > 0 and b.get("forward_executable_count", 0) == 0:
+        return "fix signal timing / run full workday collection from before match windows"
     if a["data_state"] == "BLOCKED":
         return "collect more data"
     prevalence = a["market_availability_episodes"].get("withdrawn_prevalence_pct")
@@ -341,24 +360,55 @@ def final_recommendation(a, health_status: str) -> str:
     return "collect more data"
 
 
-def append_backlog(hypotheses: list[dict], date_str: str):
+def _hypothesis_hash(date_str: str, h: dict) -> str:
+    import hashlib
+    key = f"{date_str}|{h['category']}|{h['claim']}"
+    return hashlib.sha256(key.encode()).hexdigest()[:12]
+
+
+def append_backlog(hypotheses: list[dict], date_str: str) -> dict:
+    """v0.3.7D fix: re-running the daily cycle multiple times on the same
+    date (e.g. testing, or a manual re-run) used to append the exact same
+    hypotheses again every time, since this was purely append-only with no
+    de-duplication. Each hypothesis block is now tagged with a hidden
+    `<!-- hash:... -->` marker (date + category + claim); a marker already
+    present in the file is skipped. Append-only behavior is preserved for
+    genuinely NEW hypotheses (different date, different claim, or different
+    category) -- nothing is ever deleted or rewritten, only conditionally
+    not re-added."""
+    import re
     RESEARCH_DIR.mkdir(parents=True, exist_ok=True)
-    lines = [f"\n## {date_str}\n"]
+    existing_hashes = set()
+    if BACKLOG_MD.exists():
+        existing_hashes = set(re.findall(r"<!-- hash:([a-f0-9]{12}) -->", BACKLOG_MD.read_text()))
+
+    new_lines = []
+    added = 0
     for h in hypotheses:
-        lines.append(f"- **priority**: derived from category={h['category']}, n={h['sample_size']}")
-        lines.append(f"  - hypothesis: {h['claim']}")
-        lines.append(f"  - expected_value: TBD (manual review)")
-        lines.append(f"  - required_data: more samples toward n>={EVIDENCE_MIN_N}")
-        lines.append(f"  - implementation_cost: low (data collection only, no code change implied)")
-        lines.append(f"  - risk: {h['why_it_may_be_wrong']}")
-        lines.append(f"  - stop_condition: {h['what_kills_it']}")
-        lines.append(f"  - owner: code")
-    block = "\n".join(lines) + "\n"
+        h_hash = _hypothesis_hash(date_str, h)
+        if h_hash in existing_hashes:
+            continue
+        new_lines.append(f"<!-- hash:{h_hash} -->")
+        new_lines.append(f"- **priority**: derived from category={h['category']}, n={h['sample_size']}")
+        new_lines.append(f"  - hypothesis: {h['claim']}")
+        new_lines.append(f"  - expected_value: TBD (manual review)")
+        new_lines.append(f"  - required_data: more samples toward n>={EVIDENCE_MIN_N}")
+        new_lines.append(f"  - implementation_cost: low (data collection only, no code change implied)")
+        new_lines.append(f"  - risk: {h['why_it_may_be_wrong']}")
+        new_lines.append(f"  - stop_condition: {h['what_kills_it']}")
+        new_lines.append(f"  - owner: code")
+        added += 1
+
+    if added == 0:
+        return {"appended": 0, "skipped_duplicates": len(hypotheses)}
+
+    block = f"\n## {date_str}\n\n" + "\n".join(new_lines) + "\n"
     if not BACKLOG_MD.exists():
         BACKLOG_MD.write_text("# Experiment Backlog (append-only)\n" + block)
     else:
         with open(BACKLOG_MD, "a") as f:
             f.write(block)
+    return {"appended": added, "skipped_duplicates": len(hypotheses) - added}
 
 
 def build_report(db=None) -> dict:
@@ -374,7 +424,7 @@ def build_report(db=None) -> dict:
         f = section_f_friend_learning()
         hypotheses = generate_hypotheses(a, b, c, d, e, f)
         challenge = self_challenge(a, b, c, d)
-        recommendation = final_recommendation(a, h["status"])
+        recommendation = final_recommendation(a, h["status"], b)
         return {
             "date": _now().strftime("%Y-%m-%d"), "generated_at": _now().isoformat(),
             "health_status": h["status"],
@@ -420,9 +470,11 @@ def main():
     json_path = RESEARCH_DIR / "latest_research.json"
     md_path.write_text(render_markdown(r))
     json_path.write_text(json.dumps(r, indent=2, default=str))
-    append_backlog(r["section_g_hypotheses"], r["date"])
+    backlog_result = append_backlog(r["section_g_hypotheses"], r["date"])
     print(f"Wrote {md_path}")
     print(f"Wrote {json_path}")
+    print(f"Backlog: appended {backlog_result['appended']}, skipped {backlog_result['skipped_duplicates']} "
+         "exact duplicate(s) already logged today")
     print(f"Appended {BACKLOG_MD}")
     print(f"Final recommendation: {r['section_j_final_recommendation']}")
 

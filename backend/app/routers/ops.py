@@ -22,6 +22,23 @@ Four levels, in priority order:
              status unknown, zero availability heartbeats, zero snapshots
              today).
   OK       - collection is expected, alive, fresh, and nothing above fired.
+
+v0.3.7D: added `state_detail`, a more specific label alongside `status`
+(which keeps its 4-level severity meaning unchanged -- this does not
+soften FAIL to a lesser severity for the collector-expected-but-dead case,
+it only adds a more descriptive name):
+  IDLE_POLLER_DISABLED       - status=IDLE, poller_enabled=False, and not
+                               due to a just-completed autopilot run.
+  IDLE_AFTER_COMPLETED_RUN   - status=IDLE, poller_enabled=False, and
+                               STATUS shows a recent autopilot_auto_disabled_at
+                               (poll_loop's own bounded-runtime cap fired).
+  IDLE_OUTSIDE_COLLECTION_WINDOW - status=IDLE because "now" falls outside
+                               the configured WORKDAY_COLLECTION_START/END
+                               window (independent of poller_enabled).
+  DEGRADED_EXPECTED_BUT_NOT_RUNNING - descriptive alias for the
+                               status=FAIL, COLLECTOR_NOT_ALIVE /
+                               COLLECTOR_NEVER_TICKED case: collection was
+                               expected right now but the task isn't alive.
 """
 from __future__ import annotations
 
@@ -160,20 +177,32 @@ def health(db: Session = Depends(get_db)):
         reason_codes.append("DISK_LOW")
     hard_fail = bool(reason_codes)
 
+    state_detail = None
     if hard_fail:
         status = "FAIL"
     elif not collector_expected_alive:
         status = "IDLE"
-        if not poller_enabled_in_settings:
-            reason_codes.append("POLLER_DISABLED")
         if not expected_collection_window_active:
             reason_codes.append("OUTSIDE_COLLECTION_WINDOW")
+            state_detail = "IDLE_OUTSIDE_COLLECTION_WINDOW"
+        elif not poller_enabled_in_settings:
+            reason_codes.append("POLLER_DISABLED")
+            # v0.3.7D: distinguish "never started / manually turned off"
+            # from "an autopilot run just completed its bounded cap" --
+            # poll_loop sets STATUS["autopilot_auto_disabled_at"] itself
+            # the moment it auto-disables poller_enabled.
+            if STATUS.get("autopilot_auto_disabled_at"):
+                state_detail = "IDLE_AFTER_COMPLETED_RUN"
+            else:
+                state_detail = "IDLE_POLLER_DISABLED"
     elif not collector_task_alive:
         status = "FAIL"
         reason_codes.append("COLLECTOR_NOT_ALIVE")
+        state_detail = "DEGRADED_EXPECTED_BUT_NOT_RUNNING"
     elif last_tick_age_s is None:
         status = "FAIL"
         reason_codes.append("COLLECTOR_NEVER_TICKED")
+        state_detail = "DEGRADED_EXPECTED_BUT_NOT_RUNNING"
     else:
         degraded_reasons = []
         if last_tick_age_s > cfg.max_last_poll_age_s:
@@ -196,6 +225,7 @@ def health(db: Session = Depends(get_db)):
     return {
         "checked_at": now.isoformat(),
         "status": status,
+        "state_detail": state_detail,
         "reason_codes": reason_codes,
         "next_required_action": next_required_action,
         "expected_collection_window_active": expected_collection_window_active,

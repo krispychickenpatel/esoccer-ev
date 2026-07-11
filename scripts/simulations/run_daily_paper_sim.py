@@ -63,6 +63,7 @@ N_DECISION = 400
 N_ROI_DESCRIPTIVE = 300
 
 VERDICTS = ("NOT ENOUGH DATA", "DATA QUALITY BLOCKED", "EXECUTION BLOCKED", "SOURCE/FEED BLOCKED",
+           "SIGNAL TIMING BLOCKED", "FORWARD SAMPLE NON-EXECUTABLE",
            "MODEL UNDERPERFORMS BASELINE", "MODEL SHOWS DIRECTIONAL CLV ONLY",
            "MODEL SHOWS CLEAN FORWARD EDGE CANDIDATE")
 
@@ -122,11 +123,26 @@ def historical_replay(db) -> dict:
 # ------------------------------------------------------------- B. forward clean
 
 def forward_clean(db) -> dict:
+    """v0.3.7D: separates forward-trustworthy (real system-timestamped)
+    rows by executability, not just by primary_state. Per the signal-timing
+    audit (notes/triage/v0_3_7D-signal-timing-audit.md), 100% of the
+    v0.3.7C trial's forward rows were RESEARCH_ONLY_KICKOFF/LATE_SIGNAL --
+    zero were EXECUTABLE_PREKICK. Reporting only `n` and `by_primary_state`
+    (the old shape) would let a downstream verdict treat that as a normal
+    "clean sample" when it was entirely non-executable."""
     rows = db.scalars(select(ExecutionClassification).where(
         ExecutionClassification.is_historical_degraded.is_(False))).all()
+    executable_n = sum(1 for r in rows if r.executability_label == execution_classifier_v2.EXECUTABLE_PREKICK)
+    research_only_n = sum(1 for r in rows if r.executability_label == execution_classifier_v2.RESEARCH_ONLY_KICKOFF)
+    late_n = sum(1 for r in rows if r.executability_label == execution_classifier_v2.LATE_SIGNAL)
+    unknown_start_n = sum(1 for r in rows if r.executability_label == execution_classifier_v2.UNKNOWN_START_TIME)
     return {
         "label": "CLEAN (system-timestamped forward rows only)" if rows else "PENDING (0 forward rows yet)",
         "n": len(rows),
+        "executable_n": executable_n,
+        "research_only_kickoff_n": research_only_n,
+        "late_signal_n": late_n,
+        "unknown_start_time_n": unknown_start_n,
         "by_primary_state": {s: sum(1 for r in rows if r.primary_state == s)
                              for s in set(r.primary_state for r in rows)} if rows else {},
     }
@@ -210,6 +226,17 @@ def final_verdict(a: dict, b: dict, health_status: str) -> str:
     n = a["distinct_samples"]
     if n < N_NOT_ENOUGH:
         return "NOT ENOUGH DATA"
+
+    # v0.3.7D: a forward-trustworthy sample that is entirely non-executable
+    # must never fall through to a model-vs-baseline verdict -- see
+    # notes/triage/v0_3_7D-signal-timing-audit.md. Checked BEFORE the
+    # execution/baseline checks below, which operate on the historical
+    # (degraded) sample and would otherwise overclaim.
+    if b["n"] > 0 and b["executable_n"] == 0:
+        return "SIGNAL TIMING BLOCKED"
+    if b["n"] > 0 and 0 < b["executable_n"] < N_NOT_ENOUGH:
+        return "FORWARD SAMPLE NON-EXECUTABLE"
+
     exec_dist = a["execution_state_distribution"]
     total = sum(exec_dist.values()) or 1
     if exec_dist.get("NO_DATA_AT_ENTRY", 0) / total > 0.7:

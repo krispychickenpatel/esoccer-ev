@@ -482,6 +482,10 @@ class ExecutionClassification(Base):
     primary_state: Mapped[str] = mapped_column(String(40))
     diagnostic_flags_json: Mapped[str] = mapped_column(Text, default="[]")
     is_historical_degraded: Mapped[bool] = mapped_column(Boolean, default=True)
+    # v0.3.7D: orthogonal to primary_state -- whether this signal could have
+    # been a real pre-kickoff paper entry at all, independent of whether a
+    # price was ever found for it. See engines/execution_classifier_v2.py.
+    executability_label: Mapped[str | None] = mapped_column(String(30), nullable=True)
 
 
 class ClosingRecord(Base):

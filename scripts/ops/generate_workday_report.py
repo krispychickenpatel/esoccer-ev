@@ -195,7 +195,14 @@ def build_report(db=None) -> dict:
                 "clean_system_timestamps_on_new_rows": matches_with_clean_ts > 0,
                 "availability_heartbeats_created": availability_records_today > 0,
                 "daily_report_generated": True,
-                "db_backup_created": backup_status["exists"] and (backup_status["age_hours"] or 999) < 24,
+                # v0.3.7D fix: `age_hours or 999` treated a fresh backup
+                # (age_hours=0.0, a falsy value in Python) as if it were
+                # missing (999h old), reporting db_backup_created=False for
+                # a backup that had just been made. Use an explicit None
+                # check instead of `or`.
+                "db_backup_created": (backup_status["exists"]
+                                      and backup_status["age_hours"] is not None
+                                      and backup_status["age_hours"] < 24),
                 "zero_secret_leakage": True,
                 "cumulative_clean_close_increases_when_eligible": None,
             },
