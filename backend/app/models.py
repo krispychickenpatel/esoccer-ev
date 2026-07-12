@@ -222,6 +222,17 @@ class Settings(Base):
     # unchanged from before this release).
     autopilot_max_runtime_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     autopilot_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # v0.3.7D.1: stop_autopilot() nulls autopilot_started_at/
+    # autopilot_max_runtime_minutes when a run ends, so nothing previously
+    # persisted WHEN the last run happened or how long it actually ran --
+    # reporting/monitoring code had no way to distinguish "a full workday run
+    # just completed cleanly" from "the poller was never turned on today",
+    # and fell back to a generic POLLER_DISABLED / NO_SNAPSHOTS_TODAY message
+    # in both cases. Additive, nullable, backfills NULL for all existing
+    # rows -- no behavior change for the running collector.
+    last_completed_run_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_completed_run_completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_completed_run_max_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # D22/D23: widened from 3->5 leagues after real BetsAPI data proved two
     # things wrong in D20/D17: (1) country-vs-club team skin does NOT predict
     # league -- H2H GG League and Adriatic League each mix both formats, so

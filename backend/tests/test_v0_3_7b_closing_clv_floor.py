@@ -164,4 +164,6 @@ def test_forward_clv_reports_pending_with_zero_system_timestamped_samples():
     db = _db()
     report = clv_forward_readiness.forward_clv_readiness(db)
     assert report["forward_system_timestamped_samples"] == 0
-    assert "NOT READY" in report["readiness_verdict"]
+    # v0.3.7D.1 Task 6: sample size can never override trust -- reworded
+    # from "NOT READY" to make explicit this is never decisional at any n.
+    assert "NOT DECISIONAL" in report["readiness_verdict"]

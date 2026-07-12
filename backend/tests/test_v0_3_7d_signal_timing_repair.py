@@ -83,7 +83,12 @@ def test_executable_prekick_when_well_before_actual_start():
     _live_snap(db, m, actual_start)
     pred = _pred(db, m, "T-2m", start - timedelta(minutes=2))
     label = ecv2.compute_executability(db, pred, m)
-    assert label == ecv2.EXECUTABLE_PREKICK
+    # v0.3.7D.1: renamed EXECUTABLE_PREKICK -> EXECUTABLE_PREKICK_STRICT (the
+    # scheduled-start lead gate, never the actual/observed start -- see
+    # notes/triage/v0_3_7D1-self-challenge.md Q6). This prediction is 2
+    # minutes before the SCHEDULED start, well past the lead-time gate, so
+    # it is strict regardless of actual_start.
+    assert label == ecv2.EXECUTABLE_PREKICK_STRICT
 
 
 def test_research_only_kickoff_when_late_but_horizon_is_kickoff():

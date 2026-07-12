@@ -14,6 +14,7 @@ notes/status/latest_daily_cycle.json.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -28,6 +29,11 @@ os.chdir(BACKEND_DIR)
 
 STATUS_DIR = Path("/Users/krispatell/Downloads/ESoccer/notes/status")
 
+# v0.3.7D.1 Task 9: this script never called input() to begin with -- these
+# flags exist for a consistent contract across all three ops scripts.
+YES_FLAG_REJECTION = ("--yes is not supported. Use --allow-warn to auto-accept WARN-level items. "
+                     "FAIL items always stop. Dangerous actions are never auto-confirmed.")
+
 
 def _now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -40,7 +46,19 @@ def _run_script(rel_path: str, args: list[str] | None = None) -> dict:
            "stdout_tail": proc.stdout[-2000:], "stderr_tail": proc.stderr[-2000:]}
 
 
-def main():
+def main(argv: list[str] | None = None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--non-interactive", action="store_true",
+                    help="assert non-interactive operation (this script never prompts anyway)")
+    ap.add_argument("--allow-warn", action="store_true",
+                    help="accepted for contract consistency with the other ops scripts; this script's "
+                         "own steps are pass/fail, not pass/warn/fail, so this does not change control flow")
+    ap.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
+    args = ap.parse_args(argv)
+    if args.yes:
+        print(f"FAIL: {YES_FLAG_REJECTION}", file=sys.stderr)
+        sys.exit(1)
+
     steps = []
 
     print("1/7 Health precheck...")

@@ -43,12 +43,15 @@ SIGNAL_TOO_LATE = "SIGNAL_TOO_LATE"
 TIMESTAMP_UNTRUSTWORTHY = "TIMESTAMP_UNTRUSTWORTHY"
 UNKNOWN = "UNKNOWN"
 
-# v0.3.7D executable-signal gate (Section 3) -- orthogonal to primary_state.
-EXECUTABLE_PREKICK = "EXECUTABLE_PREKICK"
+# v0.3.7D executable-signal gate (Section 3), v0.3.7D.1 hindsight fix
+# (Section 3) -- orthogonal to primary_state.
+EXECUTABLE_PREKICK_STRICT = "EXECUTABLE_PREKICK_STRICT"
+EXECUTABLE_VIA_START_DELAY = "EXECUTABLE_VIA_START_DELAY"
 RESEARCH_ONLY_KICKOFF = "RESEARCH_ONLY_KICKOFF"
 LATE_SIGNAL = "LATE_SIGNAL"
 UNKNOWN_START_TIME = "UNKNOWN_START_TIME"
 MINIMUM_USEFUL_LEAD_SECONDS = 20.0
+LEAD_TIME_GATES_S = (20.0, 30.0, 45.0)
 
 STALE_THRESHOLD_S = 60.0
 HISTORICAL_CREATED_AT_GAP_S = 300.0  # 5 min: created_at far from signal_time -> backfill artifact
@@ -56,18 +59,39 @@ HISTORICAL_CREATED_AT_GAP_S = 300.0  # 5 min: created_at far from signal_time ->
 
 def compute_executability(db: Session, pred: PredictionLedger | None, match: Match | None,
                          min_lead_s: float = MINIMUM_USEFUL_LEAD_SECONDS) -> str:
-    """A signal is executable only if
-    prediction_time <= actual_start_or_scheduled_start - min_lead_s.
+    """Strict, no-hindsight executability gate (v0.3.7D.1 fix --
+    notes/triage/v0_3_7D1-self-challenge.md Q6).
+
+    EXECUTABLE_PREKICK_STRICT requires the lead to be measured against
+    SCHEDULED start (Match.start_time) -- the only timestamp knowable AT
+    SIGNAL TIME. The v0.3.7D version of this function measured lead against
+    actual/live start instead, which is only knowable AFTER the match has
+    begun -- using it to decide whether a signal "was executable" is itself
+    a hindsight construction (real data: 29 of 32 audited matches had
+    actual start 7-60s after scheduled start, so a signal that only clears
+    the lead gate because kickoff happened to run late was being counted
+    as if a real-time trader could have known that in advance).
+
+    A signal that fails the strict scheduled-start gate but WOULD pass if
+    measured against the (retrospectively-known) actual start is
+    EXECUTABLE_VIA_START_DELAY -- diagnostic only. Hard rule, this release:
+    never use actual start delay to retroactively launder a KICKOFF signal
+    into normal pre-kick executability.
+
     Orthogonal to primary_state: a row can be e.g. NO_DATA_AT_ENTRY AND
-    EXECUTABLE_PREKICK at the same time (a genuinely timely signal that
-    simply had no odds row at the target delay)."""
+    EXECUTABLE_PREKICK_STRICT at the same time (a genuinely timely signal
+    that simply had no odds row at the target delay)."""
     if pred is None or match is None or match.start_time is None:
         return UNKNOWN_START_TIME
+
+    if pred.prediction_time <= match.start_time - timedelta(seconds=min_lead_s):
+        return EXECUTABLE_PREKICK_STRICT
+
     actual_start, _used_fallback = _actual_start(db, match)
-    if actual_start is None:
-        return UNKNOWN_START_TIME
-    if pred.prediction_time <= actual_start - timedelta(seconds=min_lead_s):
-        return EXECUTABLE_PREKICK
+    if (actual_start is not None and actual_start > match.start_time
+            and pred.prediction_time <= actual_start - timedelta(seconds=min_lead_s)):
+        return EXECUTABLE_VIA_START_DELAY
+
     if pred.horizon_label == "KICKOFF":
         return RESEARCH_ONLY_KICKOFF
     return LATE_SIGNAL

@@ -376,6 +376,14 @@ async def poll_loop(provider_factory):
                     if elapsed_min >= s.autopilot_max_runtime_minutes:
                         s.poller_enabled = False
                         cap = s.autopilot_max_runtime_minutes
+                        # v0.3.7D.1: persist the completed run's window before
+                        # clearing it, so reporting can distinguish "a capped
+                        # run just finished cleanly" (IDLE_AFTER_COMPLETED_RUN)
+                        # from "the poller was never turned on" -- see the
+                        # last_completed_run_* model comment.
+                        s.last_completed_run_started_at = s.autopilot_started_at
+                        s.last_completed_run_completed_at = _now()
+                        s.last_completed_run_max_minutes = cap
                         # Clear the run's own bookkeeping too -- leaving
                         # autopilot_started_at set makes every later status
                         # check report a growing, increasingly nonsensical

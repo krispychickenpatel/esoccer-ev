@@ -46,6 +46,7 @@ class WorkdayConfig:
     min_disk_headroom_mb: float
     max_last_poll_age_s: float
     max_last_ingest_age_s: float
+    autopilot_startup_grace_s: float
 
     def in_collection_window(self, now_utc: datetime) -> bool:
         """True if no window is configured (always-active, preserves
@@ -74,4 +75,10 @@ def load_workday_config() -> WorkdayConfig:
         min_disk_headroom_mb=_env_float("WORKDAY_MIN_DISK_HEADROOM_MB", 500.0),
         max_last_poll_age_s=_env_float("WORKDAY_MAX_LAST_POLL_AGE_S", 180.0),
         max_last_ingest_age_s=_env_float("WORKDAY_MAX_LAST_INGEST_AGE_S", 600.0),
+        # v0.3.7D.1 Task 10: grace period after autopilot_started_at during
+        # which zero collector activity is expected and must NOT trigger
+        # FAIL (COLLECTOR_NOT_ALIVE/COLLECTOR_NEVER_TICKED) -- the provider
+        # connection, first poll cycle, and first snapshot all take a few
+        # seconds to a few minutes on a cold start.
+        autopilot_startup_grace_s=_env_float("AUTOPILOT_STARTUP_GRACE_SECONDS", 180.0),
     )

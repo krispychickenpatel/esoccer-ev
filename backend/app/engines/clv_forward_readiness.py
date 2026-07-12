@@ -72,7 +72,15 @@ def _devig_close(db: Session, match_id: int, selection: str) -> float | None:
 
 
 def historical_clv_report(db: Session) -> dict:
-    pairs = _entry_close_pairs(db)
+    """v0.3.7D.1 partition fix: this used to call `_entry_close_pairs(db)`
+    with NO filter at all and label the ENTIRE unfiltered result DEGRADED --
+    every forward (system-timestamped) pair that `forward_clv_readiness()`
+    also reports on was being silently double-counted here too. Proven on
+    real data (notes/triage/v0_3_7D1-partition-audit.json): 1281 of 1512
+    "historical" pairs were actually forward, system-timestamped rows.
+    Fixed to explicitly exclude forward rows -- this report now only ever
+    describes genuinely historical (no system timestamps) data."""
+    pairs = [p for p in _entry_close_pairs(db) if not p["has_system_ts"]]
     n = len(pairs)
     high_quality_pairs = [p for p in pairs if p["close_quality"] == HIGH]
 
@@ -94,13 +102,12 @@ def historical_clv_report(db: Session) -> dict:
         "decision_grade_threshold": DECISION_GRADE_MIN_N,
     }
 
+    # v0.3.7D.1 Task 6 hard rule: sample size can NEVER override trust.
+    # Historical/provider-time data is degraded regardless of n -- never
+    # print a DECISION-GRADE (or EVIDENCE/DIRECTIONAL) label for it, no
+    # matter how large the sample gets.
     n_high = len(high_quality_pairs)
-    if n_high >= DECISION_GRADE_MIN_N:
-        grade = "DECISION-GRADE (by sample size only -- still DEGRADED, provider-time)"
-    elif n_high >= DIRECTIONAL_GRADE_MIN_N or n >= DIRECTIONAL_GRADE_MIN_N:
-        grade = "DIRECTIONAL ONLY -- not decision-grade"
-    else:
-        grade = "INSUFFICIENT SAMPLE"
+    grade = "DEGRADED -- DESCRIPTIVE ONLY (provider-time, not decisional at any sample size)"
 
     return {
         "status": DEGRADED_LABEL,
@@ -109,6 +116,7 @@ def historical_clv_report(db: Session) -> dict:
         "distinct_samples_with_close": n,
         "high_quality_close_samples": n_high,
         "avg_provider_time_clv_pct": avg_clv,
+        "roi_descriptive_only": True,
         "sample_grade": grade,
         "v0_3_7a_g4_reference_strict_close_n": 54,
         "exclusion_waterfall": exclusion_waterfall,
@@ -119,7 +127,16 @@ def historical_clv_report(db: Session) -> dict:
 def forward_clv_readiness(db: Session) -> dict:
     """System-availability-time CLV -- only computable from ClosingRecord
     rows that carry real polled_at/ingested_at (i.e. built from rows
-    collected after this release shipped)."""
+    collected after this release shipped).
+
+    v0.3.7D.1: this is an ALL-FORWARD-SIGNAL diagnostic view -- it does NOT
+    apply the strict, no-hindsight executability filter (Task 3), so it
+    still includes RESEARCH_ONLY_KICKOFF and EXECUTABLE_VIA_START_DELAY
+    rows. Per Task 6, sample size can never override trust: this view is
+    always PROVIDER-TIME-CLOCK-CORRECT-BUT-NOT-EXECUTABILITY-FILTERED and
+    is NEVER labeled DIRECTIONAL/EVIDENCE/DECISION_GRADE, no matter how
+    large n gets. Use `engines.strict_forward_metrics.strict_forward_clv()`
+    for the actual decisional metric."""
     pairs = _entry_close_pairs(db)
     forward_pairs = [p for p in pairs if p["has_system_ts"]]
     n = len(forward_pairs)
@@ -134,17 +151,12 @@ def forward_clv_readiness(db: Session) -> dict:
 
     filled_only = [p for p in forward_pairs if p["all_three_present"]]
 
-    if n == 0:
-        readiness = "NOT READY -- zero forward (system-timestamped) closing records exist yet"
-    elif n < DIRECTIONAL_GRADE_MIN_N:
-        readiness = f"NOT READY -- n={n} below directional threshold ({DIRECTIONAL_GRADE_MIN_N})"
-    elif n < DECISION_GRADE_MIN_N:
-        readiness = f"DIRECTIONAL ONLY -- n={n}, below decision-grade threshold ({DECISION_GRADE_MIN_N})"
-    else:
-        readiness = f"DECISION-GRADE eligible on sample size -- n={n}"
+    readiness = ("NOT DECISIONAL -- zero forward (system-timestamped) closing records exist yet" if n == 0
+                else f"NOT DECISIONAL -- PROVIDER-TIME DIAGNOSTIC ONLY (n={n}); not executability-filtered. "
+                     "See strict_forward_metrics.strict_forward_clv() for the decisional number.")
 
     return {
-        "status": "PENDING FORWARD COLLECTION" if n == 0 else "PARTIAL",
+        "status": "PENDING FORWARD COLLECTION" if n == 0 else "PARTIAL -- DIAGNOSTIC ONLY",
         "clock_used": "system-availability-time (ingested_at/polled_at)",
         "forward_system_timestamped_samples": n,
         "all_signal_avg_clv_pct": avg_clv,

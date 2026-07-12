@@ -35,6 +35,9 @@ LOGS_DIR = REPO_DIR / "logs" / "workday"
 INCIDENTS_DIR = Path("/Users/krispatell/Downloads/ESoccer/notes/status/incidents")
 
 REQUIRED_ENV_VARS = ("BETSAPI_KEY", "BETSAPI_TOKEN")  # either satisfies (see betsapi_provider.py)
+
+YES_FLAG_REJECTION = ("--yes is not supported. Use --allow-warn to auto-accept WARN-level items. "
+                     "FAIL items always stop. Dangerous actions are never auto-confirmed.")
 REQUIRED_V037B_COLUMNS = {
     "odds_snapshots": ("source_ts", "polled_at", "response_received_at", "ingested_at",
                        "poll_cycle_id", "provider_event_id"),
@@ -123,6 +126,15 @@ def stop_autopilot():
     try:
         s = db.get(Settings, 1)
         if s:
+            # v0.3.7D.1: persist the completed-run window BEFORE clearing the
+            # live autopilot_started_at/autopilot_max_runtime_minutes fields --
+            # see the model comment on last_completed_run_* -- otherwise
+            # reporting has no way to know a run just finished vs. never
+            # started, and reports the wrong (generic) status.
+            if s.autopilot_started_at is not None:
+                s.last_completed_run_started_at = s.autopilot_started_at
+                s.last_completed_run_completed_at = _now()
+                s.last_completed_run_max_minutes = s.autopilot_max_runtime_minutes
             s.poller_enabled = False
             s.autopilot_started_at = None
             s.autopilot_max_runtime_minutes = None
@@ -150,6 +162,51 @@ def write_incident(entry: dict):
     path.write_text(json.dumps(entry, indent=2, default=str))
 
 
+def _db_snapshot_count() -> int | None:
+    """v0.3.7D.1 Task 10: DB-progress fallback. Read directly (never write)
+    to check whether the collector is still making progress even when this
+    monitor's OWN http client can't reach the health endpoint -- an HTTP
+    problem (this process, network, port) is not proof the collector died."""
+    try:
+        from app.database import SessionLocal
+        from app.models import OddsSnapshot
+        from sqlalchemy import func, select
+        db = SessionLocal()
+        try:
+            return db.scalar(select(func.count(OddsSnapshot.id)))
+        finally:
+            db.close()
+    except Exception:
+        return None
+
+
+def _db_poller_enabled() -> bool:
+    """Read-only fallback for whether the poller is enabled, used only when
+    the HTTP health endpoint itself is unreachable."""
+    try:
+        from app.database import SessionLocal
+        from app.models import Settings
+        db = SessionLocal()
+        try:
+            s = db.get(Settings, 1)
+            return bool(s and s.poller_enabled)
+        finally:
+            db.close()
+    except Exception:
+        return True  # fail open -- don't stop the monitor loop on a read error
+
+
+def classify_http_failure(consecutive_failures: int) -> tuple[str, str]:
+    """v0.3.7D.1 Task 10: escalation, not an instant FAIL, on the FIRST http
+    timeout -- a single slow response is common and not evidence of a dead
+    collector. Resets to 0 by the caller after any successful call."""
+    if consecutive_failures <= 1:
+        return "WARN", "MONITOR_HTTP_TIMEOUT_TRANSIENT"
+    if consecutive_failures == 2:
+        return "DEGRADED", "MONITOR_HTTP_TIMEOUT_REPEATED"
+    return "FAIL", "MONITOR_HTTP_ERROR"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--max-minutes", type=int, required=True,
@@ -160,7 +217,17 @@ def main():
     ap.add_argument("--densified", action="store_true",
                     help="also enable densified near-kickoff polling (requires WORKDAY_ENABLE_DENSIFIED_POLLING=true too)")
     ap.add_argument("--check-interval-s", type=int, default=60)
+    ap.add_argument("--non-interactive", action="store_true",
+                    help="assert non-interactive operation (this script never prompts anyway)")
+    ap.add_argument("--allow-warn", action="store_true",
+                    help="accepted for contract consistency with the other ops scripts; every FAIL-level "
+                         "check in this script already stops unconditionally, so this does not relax anything")
+    ap.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.yes:
+        print(f"FAIL: {YES_FLAG_REJECTION}", file=sys.stderr)
+        sys.exit(1)
 
     print("=== v0.3.7C Workday Autopilot ===")
     print("No live betting. No bet placement. No bankroll automation. No model promotion.")
@@ -229,14 +296,30 @@ def main():
 
     start = time.monotonic()
     max_seconds = args.max_minutes * 60
+    consecutive_http_failures = 0
+    last_db_count = _db_snapshot_count()
     try:
         while not _shutdown_requested:
             try:
-                h = httpx.get("http://127.0.0.1:8000/api/ops/health", timeout=5).json()
+                h = httpx.get("http://127.0.0.1:8000/api/ops/health", timeout=10).json()
+                consecutive_http_failures = 0  # v0.3.7D.1 Task 10: reset after any success
             except Exception as e:
-                h = {"status": "FAIL", "reason_codes": ["MONITOR_HTTP_ERROR"],
-                    "poller_enabled_in_settings": True}
-                print(f"WARNING: could not reach backend health endpoint: {e}")
+                consecutive_http_failures += 1
+                status, reason = classify_http_failure(consecutive_http_failures)
+                # v0.3.7D.1 Task 10: DB-progress fallback. The collector may
+                # be perfectly healthy even though THIS monitor process can't
+                # reach the HTTP endpoint (network blip, port contention,
+                # etc.) -- never claim collector failure while the DB itself
+                # is still visibly making progress.
+                db_count = _db_snapshot_count()
+                if db_count is not None and last_db_count is not None and db_count > last_db_count:
+                    status, reason = "DEGRADED_MONITOR_ONLY", "MONITOR_HTTP_UNREACHABLE_BUT_DB_PROGRESSING"
+                if db_count is not None:
+                    last_db_count = db_count
+                h = {"status": status, "reason_codes": [reason],
+                    "poller_enabled_in_settings": _db_poller_enabled()}
+                print(f"{status}: could not reach backend health endpoint "
+                     f"(consecutive_failures={consecutive_http_failures}): {e}")
             entry = {"at": _now().isoformat(), "status": h["status"], "reason_codes": h["reason_codes"]}
             write_heartbeat_log(entry)
             print(f"[{entry['at']}] health={h['status']} reasons={h['reason_codes']}")

@@ -21,7 +21,7 @@ os.chdir(BACKEND_DIR)
 from sqlalchemy import func, select  # noqa: E402
 
 from app.database import SessionLocal  # noqa: E402
-from app.engines import market_availability  # noqa: E402
+from app.engines import daily_recommendation, market_availability, spot_check_readiness  # noqa: E402
 from app.models import (ClosingRecord, ExecutionClassification, FriendPick,  # noqa: E402
                         MarketAvailabilityRecord, Match, OddsSnapshot, PollCycle,
                         RawProviderResponse)
@@ -123,6 +123,7 @@ def build_report(db=None) -> dict:
             .group_by(ExecutionClassification.primary_state)).all())
 
         prevalence = market_availability.prevalence_report(db)
+        recommendation = daily_recommendation.build_recommendation(db, h)
 
         friend_picks_today = 0
         friend_clean_total = friend_retro_total = 0
@@ -189,6 +190,7 @@ def build_report(db=None) -> dict:
             "friend_clean_total": friend_clean_total,
             "friend_retro_total": friend_retro_total,
             "spot_checks_logged_today": spot_checks_today,
+            "spot_check_readiness": spot_check_readiness.spot_check_readiness_report(db),
             "backup_status": backup_status,
             "workday_success_criteria": {
                 "collector_uptime_over_90pct": None,
@@ -207,6 +209,7 @@ def build_report(db=None) -> dict:
                 "cumulative_clean_close_increases_when_eligible": None,
             },
             "next_required_action": h["next_required_action"],
+            "daily_recommendation": recommendation,
         }
     finally:
         if owns_session:
@@ -253,6 +256,10 @@ def render_markdown(r: dict) -> str:
         f"(clean total: {r['friend_clean_total']}, retro total: {r['friend_retro_total']})",
         f"- spot-checks logged today: {r['spot_checks_logged_today']}",
         "",
+        "## Spot-check / placeability readiness (coverage evidence, not a pass/fail gate)",
+        f"**{r['spot_check_readiness']['label']}**",
+        f"```json\n{json.dumps(r['spot_check_readiness'], indent=2)}\n```",
+        "",
         "## Backup",
         f"- {r['backup_status']}",
         "",
@@ -260,6 +267,10 @@ def render_markdown(r: dict) -> str:
         f"```json\n{json.dumps(r['workday_success_criteria'], indent=2)}\n```",
         "",
         f"## Next required action\n{r['next_required_action']}",
+        "",
+        "## Daily recommendation",
+        f"**{r['daily_recommendation']['message']}**",
+        f"```json\n{json.dumps(r['daily_recommendation'], indent=2, default=str)}\n```",
         "",
         "## Incidents",
         f"```json\n{json.dumps(h['incidents'], indent=2)}\n```",

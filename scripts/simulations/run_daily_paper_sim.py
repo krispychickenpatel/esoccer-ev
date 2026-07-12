@@ -29,9 +29,10 @@ os.chdir(BACKEND_DIR)
 from sqlalchemy import select  # noqa: E402
 
 from app.database import SessionLocal  # noqa: E402
-from app.engines import (closing_records, entry_floor_diagnostics,  # noqa: E402
+from app.engines import (closing_records, daily_recommendation, entry_floor_diagnostics,  # noqa: E402
                          execution_classifier_v2, market_availability,
-                         paper_trade, profit_gates, winner_edge)
+                         paper_trade, profit_gates, spot_check_readiness,
+                         strict_forward_metrics, verdict_hierarchy, winner_edge)
 from app.models import ExecutionClassification, FriendPick, PaperTrade  # noqa: E402
 
 SIM_DIR = Path("/Users/krispatell/Downloads/ESoccer/notes/simulations")
@@ -88,9 +89,34 @@ def _longest_losing_streak(trades) -> int:
 # ------------------------------------------------------------- A. historical replay
 
 def historical_replay(db) -> dict:
-    model_trades = db.scalars(select(PaperTrade).where(PaperTrade.signal_source == "MODEL")).all()
-    report = paper_trade.report(db)
-    model_report = winner_edge.model_report(db)
+    """v0.3.7D.1 partition fix: this used to run over ALL MODEL paper trades
+    unconditionally labeled DEGRADED -- the exact same partition-leak
+    pattern already fixed in clv_forward_readiness.historical_clv_report()
+    (proven on real data: notes/triage/v0_3_7D1-partition-audit.json,
+    forward_rows_mislabeled_historical_under_current_code). Now restricted
+    to genuinely historical-degraded predictions only, via
+    strict_forward_metrics.partition_model_prediction_ids() -- a prediction
+    counts as forward-trustworthy if ANY of its delay-bucket trades are
+    forward-trustworthy, so it can never appear in both partitions.
+    Execution-state distribution uses a fresh, read-only recompute
+    (classify_paper_trade) rather than the writing, stale-prone
+    classify_all() the old code called here."""
+    partition = strict_forward_metrics.partition_model_prediction_ids(db)
+    historical_ids = partition["historical_prediction_ids"]
+
+    all_model_trades = db.scalars(select(PaperTrade).where(PaperTrade.signal_source == "MODEL")).all()
+    model_trades = [t for t in all_model_trades if t.signal_id in historical_ids]
+
+    all_samples = winner_edge._model_samples(db)
+    samples = [s for s in all_samples if s["prediction_id"] in historical_ids]
+    scored_samples = [s for s in samples if s["scored"]]
+    n = len(scored_samples)
+    w = [s["winner_correct"] for s in scored_samples if s["winner_correct"] is not None]
+    f = [s["favorite_correct"] for s in scored_samples if s["favorite_correct"] is not None]
+    winner_acc = round(100 * sum(w) / len(w), 1) if w else None
+    fav_acc = round(100 * sum(f) / len(f), 1) if f else None
+    margin = round(winner_acc - fav_acc, 1) if winner_acc is not None and fav_acc is not None else None
+
     floor_diag = entry_floor_diagnostics.run(db)
     risk = profit_gates.risk_gate(db)
 
@@ -99,12 +125,19 @@ def historical_replay(db) -> dict:
     win_count = sum(1 for t in settled if (t.paper_pl_usd or 0) > 0)
     draw_exposure = sum(1 for t in model_trades if t.selection == "draw")
 
+    execution = winner_edge._delay_execution_metrics(model_trades)
+    state_dist: dict[str, int] = {}
+    for t in model_trades:
+        primary, _flags, _degraded, _executability = execution_classifier_v2.classify_paper_trade(db, t)
+        state_dist[primary] = state_dist.get(primary, 0) + 1
+
     return {
-        "label": "DEGRADED (provider-time historical rows)",
-        "eligible_signals": model_report["total_predictions"],
-        "distinct_samples": model_report["distinct_samples"],
+        "label": "DEGRADED (provider-time historical rows) -- v0.3.7D.1 partition-fixed: "
+                 "forward-trustworthy predictions excluded",
+        "eligible_signals": len(samples),
+        "distinct_samples": n,
         "filled_trades": len(filled_or_settled),
-        "fill_rate_pct": report["by_source"]["MODEL"]["by_delay_seconds"].get("30", {}).get("fill_rate_pct"),
+        "fill_rate_pct": execution.get("30", {}).get("fill_rate_pct"),
         "realized_paper_roi_by_delay": winner_edge._roi_by_delay(db, model_trades),
         "avg_odds_taken": (round(sum(t.price_decimal for t in filled_or_settled if t.price_decimal) /
                                  len([t for t in filled_or_settled if t.price_decimal]), 3)
@@ -113,26 +146,34 @@ def historical_replay(db) -> dict:
         "draw_exposure_count": draw_exposure,
         "max_drawdown_units": risk.get("max_drawdown_units"),
         "longest_losing_streak": _longest_losing_streak(model_trades),
-        "market_baseline_winner_accuracy_pct": model_report["favorite_baseline_accuracy_pct"],
-        "current_vs_market_baseline_margin_pts": model_report["margin_vs_favorite_pts"],
+        "market_baseline_winner_accuracy_pct": fav_acc,
+        "current_vs_market_baseline_margin_pts": margin,
         "entry_floor_whatif": floor_diag["whatif_lower_floor_simulation"],
-        "execution_state_distribution": execution_classifier_v2.classify_all(db)["by_primary_state"],
+        "execution_state_distribution": state_dist,
+        "roi_descriptive_only": True,
+        "sample_grade": "DEGRADED -- DESCRIPTIVE ONLY (provider-time, not decisional at any sample size)",
+        "partition_audit": {
+            "total_model_predictions_all_eras": len(all_samples),
+            "historical_degraded_predictions": len(historical_ids),
+            "forward_trustworthy_predictions_excluded": len(partition["forward_prediction_ids"]),
+        },
     }
 
 
 # ------------------------------------------------------------- B. forward clean
 
 def forward_clean(db) -> dict:
-    """v0.3.7D: separates forward-trustworthy (real system-timestamped)
-    rows by executability, not just by primary_state. Per the signal-timing
-    audit (notes/triage/v0_3_7D-signal-timing-audit.md), 100% of the
-    v0.3.7C trial's forward rows were RESEARCH_ONLY_KICKOFF/LATE_SIGNAL --
-    zero were EXECUTABLE_PREKICK. Reporting only `n` and `by_primary_state`
-    (the old shape) would let a downstream verdict treat that as a normal
-    "clean sample" when it was entirely non-executable."""
+    """v0.3.7D/D.1: separates forward-trustworthy (real system-timestamped)
+    rows by STRICT (no-hindsight) executability, not just by primary_state.
+    EXECUTABLE_VIA_START_DELAY is reported separately and NEVER folded into
+    `executable_n` -- see notes/triage/v0_3_7D1-self-challenge.md Q6:
+    counting a signal as executable only because actual kickoff happened
+    to run late is a hindsight construction a real-time trader could not
+    have relied on."""
     rows = db.scalars(select(ExecutionClassification).where(
         ExecutionClassification.is_historical_degraded.is_(False))).all()
-    executable_n = sum(1 for r in rows if r.executability_label == execution_classifier_v2.EXECUTABLE_PREKICK)
+    executable_n = sum(1 for r in rows if r.executability_label == execution_classifier_v2.EXECUTABLE_PREKICK_STRICT)
+    via_delay_n = sum(1 for r in rows if r.executability_label == execution_classifier_v2.EXECUTABLE_VIA_START_DELAY)
     research_only_n = sum(1 for r in rows if r.executability_label == execution_classifier_v2.RESEARCH_ONLY_KICKOFF)
     late_n = sum(1 for r in rows if r.executability_label == execution_classifier_v2.LATE_SIGNAL)
     unknown_start_n = sum(1 for r in rows if r.executability_label == execution_classifier_v2.UNKNOWN_START_TIME)
@@ -140,6 +181,7 @@ def forward_clean(db) -> dict:
         "label": "CLEAN (system-timestamped forward rows only)" if rows else "PENDING (0 forward rows yet)",
         "n": len(rows),
         "executable_n": executable_n,
+        "executable_via_start_delay_n": via_delay_n,
         "research_only_kickoff_n": research_only_n,
         "late_signal_n": late_n,
         "unknown_start_time_n": unknown_start_n,
@@ -210,6 +252,47 @@ def friend_shadow(db) -> dict:
     }
 
 
+# ------------------------------------------------------------- G. strict forward (v0.3.7D.1)
+
+def strict_forward_section(db) -> dict:
+    """v0.3.7D.1 Tasks 2/3/4/5: the reconciled executability x primary-state
+    cross-tab, strict executable-forward CLV at each lead-time gate, and the
+    paired CurrentModel-vs-MarketBaseline comparison -- all on the strict,
+    no-hindsight, forward-clean subset. This is the section the whole
+    release exists to add; everything else in this file is unchanged
+    historical/diagnostic reporting."""
+    cross_tab = strict_forward_metrics.forward_executability_primary_state_cross_tab(db)
+    clv_all_gates = strict_forward_metrics.strict_forward_clv_all_gates(db)
+    paired_20s = strict_forward_metrics.paired_market_baseline_comparison(db, lead_s=20.0)
+    return {"cross_tab": cross_tab, "strict_clv_by_lead_gate": clv_all_gates,
+           "paired_baseline_comparison_20s": paired_20s}
+
+
+# ------------------------------------------------------------- H. spot-check readiness (v0.3.7D.1)
+
+def spot_check_section(db) -> dict:
+    return spot_check_readiness.spot_check_readiness_report(db)
+
+
+# ------------------------------------------------------------- I. deterministic verdict hierarchy (v0.3.7D.1)
+
+def verdict_hierarchy_section(db, g: dict, health: dict) -> dict:
+    """v0.3.7D.1 Task 7: the new 10-branch deterministic verdict, computed
+    alongside (not replacing) the pre-existing `final_verdict()` legacy
+    string verdict below -- both are reported; this is the decisional one
+    per this release's hard rules."""
+    active_run = health.get("active_run")
+    last_completed_run = health.get("last_completed_run")
+    collection_has_run = active_run is not None or last_completed_run is not None
+    active_window = bool(health.get("expected_collection_window_active", True))
+    return verdict_hierarchy.determine_verdict(
+        collection_has_run=collection_has_run,
+        active_collection_window=active_window,
+        cross_tab=g["cross_tab"],
+        strict_clv=g["strict_clv_by_lead_gate"]["lead_20s"],
+        paired=g["paired_baseline_comparison_20s"])
+
+
 def _gate_label(n: int) -> str:
     if n < N_NOT_ENOUGH:
         return "NOT ENOUGH DATA"
@@ -260,7 +343,11 @@ def build_report(db=None) -> dict:
         d = entry_timing(db)
         e = market_availability_sim(db)
         f = friend_shadow(db)
+        g = strict_forward_section(db)
+        spot = spot_check_section(db)
         verdict = final_verdict(a, b, h["status"])
+        verdict_v2 = verdict_hierarchy_section(db, g, h)
+        recommendation = daily_recommendation.build_recommendation(db, h)
         return {
             "date": _now().strftime("%Y-%m-%d"), "generated_at": _now().isoformat(),
             "health_status": h["status"],
@@ -272,6 +359,7 @@ def build_report(db=None) -> dict:
             },
             "a_historical_replay": a, "b_forward_clean": b, "c_clv_first": c,
             "d_entry_timing": d, "e_market_availability": e, "f_friend_shadow": f,
+            "g_strict_forward": g, "h_spot_check_readiness": spot,
             "self_challenge": {
                 "what_could_be_wrong": "Historical numbers are DEGRADED (provider-time only) -- any ROI/CLV "
                                       "here is a non-executable proxy, not evidence of real tradeable edge.",
@@ -279,6 +367,8 @@ def build_report(db=None) -> dict:
                                           "different picture than the historical DEGRADED numbers.",
             },
             "final_verdict": verdict,
+            "verdict_hierarchy": verdict_v2,
+            "daily_recommendation": recommendation,
         }
     finally:
         if owns_session:
@@ -301,7 +391,18 @@ def render_markdown(r: dict) -> str:
         "## 4. Execution failure breakdown",
         f"```json\n{json.dumps(r['a_historical_replay']['execution_state_distribution'], indent=2)}\n```", "",
         "## 5. Self-challenge", f"```json\n{json.dumps(r['self_challenge'], indent=2)}\n```", "",
-        "## 6. Final daily simulation verdict", f"**{r['final_verdict']}**",
+        "## 6. Final daily simulation verdict (legacy)", f"**{r['final_verdict']}**", "",
+        "## 7. Strict forward: cross-tab, CLV-by-lead-gate, paired baseline (v0.3.7D.1)",
+        f"```json\n{json.dumps(r['g_strict_forward'], indent=2, default=str)}\n```", "",
+        "## 8. Spot-check / placeability readiness (coverage evidence, not a gate)",
+        f"**{r['h_spot_check_readiness']['label']}**",
+        f"```json\n{json.dumps(r['h_spot_check_readiness'], indent=2)}\n```", "",
+        "## 9. Deterministic verdict hierarchy (v0.3.7D.1, decisional)",
+        f"**{r['verdict_hierarchy']['verdict']}**",
+        f"```json\n{json.dumps(r['verdict_hierarchy'], indent=2)}\n```", "",
+        "## 10. Daily recommendation",
+        f"**{r['daily_recommendation']['message']}**",
+        f"```json\n{json.dumps(r['daily_recommendation'], indent=2, default=str)}\n```",
     ]
     return "\n".join(lines)
 

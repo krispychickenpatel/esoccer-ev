@@ -69,6 +69,7 @@ NEXT_ACTION_BY_REASON = {
     "QUOTA_UNKNOWN": "No X-RateLimit-* headers observed yet -- treat quota as unknown, not safe, until a real call succeeds.",
     "NO_AVAILABILITY_HEARTBEATS": "Confirm process_snapshots() is being called -- zero heartbeat rows written today.",
     "NO_SNAPSHOTS_TODAY": "Confirm tracked_leagues/sportsbooks_tracked are non-empty and BETSAPI_KEY is set.",
+    "STARTUP_GRACE_PERIOD_ACTIVE": "No action needed -- autopilot just started; waiting for the first poll/ingest tick.",
 }
 
 
@@ -122,10 +123,26 @@ def health(db: Session = Depends(get_db)):
     last_availability_heartbeat_at = last_heartbeat.observed_at.isoformat() if last_heartbeat else None
 
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    settings_row = db.get(Settings, 1)
+
+    # v0.3.7D.1 Task 10: midnight-rollover fix. A calendar-date lower bound
+    # spuriously reads zero right after midnight even though an autopilot
+    # run has been collecting continuously since before midnight --
+    # reproduced live as a 2026-07-12T00:00:35 NO_SNAPSHOTS_TODAY false
+    # alarm with a run active since the prior afternoon. Whenever a run is
+    # active, count "since run start" instead of "since calendar midnight" --
+    # this window is never narrower than the true activity period, so it
+    # cannot introduce an undercount in the other direction.
+    activity_window_start = today_start
+    activity_window_kind = "calendar_today"
+    if settings_row and settings_row.autopilot_started_at:
+        activity_window_start = settings_row.autopilot_started_at
+        activity_window_kind = "since_run_start"
+
     snapshots_today = db.scalar(select(func.count(OddsSnapshot.id)).where(
-        OddsSnapshot.collected_at >= today_start)) or 0
+        OddsSnapshot.collected_at >= activity_window_start)) or 0
     availability_records_today = db.scalar(select(func.count(MarketAvailabilityRecord.id)).where(
-        MarketAvailabilityRecord.observed_at >= today_start)) or 0
+        MarketAvailabilityRecord.observed_at >= activity_window_start)) or 0
 
     recent_live = db.scalars(select(OddsSnapshot).where(
         OddsSnapshot.phase == "live", OddsSnapshot.collected_at >= now - timedelta(hours=6),
@@ -163,7 +180,6 @@ def health(db: Session = Depends(get_db)):
 
     db_writable = _db_writable()
     disk_headroom_mb = _disk_headroom_mb()
-    settings_row = db.get(Settings, 1)
     poller_enabled_in_settings = bool(settings_row and settings_row.poller_enabled)
     collector_task_alive = bool(STATUS.get("running"))
     expected_collection_window_active = cfg.in_collection_window(now)
@@ -176,6 +192,16 @@ def health(db: Session = Depends(get_db)):
     if disk_headroom_mb is not None and disk_headroom_mb < cfg.min_disk_headroom_mb:
         reason_codes.append("DISK_LOW")
     hard_fail = bool(reason_codes)
+
+    # v0.3.7D.1 Task 10: startup grace. Right after autopilot_started_at,
+    # zero collector activity is expected for a few seconds while the
+    # backend connects to the provider and completes its first poll cycle
+    # -- without this, a FAIL/COLLECTOR_NOT_ALIVE or COLLECTOR_NEVER_TICKED
+    # verdict would fire on every single autopilot start, a false alarm.
+    run_age_s = None
+    if settings_row and settings_row.autopilot_started_at:
+        run_age_s = (now - settings_row.autopilot_started_at).total_seconds()
+    in_startup_grace = run_age_s is not None and run_age_s < cfg.autopilot_startup_grace_s
 
     state_detail = None
     if hard_fail:
@@ -190,11 +216,23 @@ def health(db: Session = Depends(get_db)):
             # v0.3.7D: distinguish "never started / manually turned off"
             # from "an autopilot run just completed its bounded cap" --
             # poll_loop sets STATUS["autopilot_auto_disabled_at"] itself
-            # the moment it auto-disables poller_enabled.
-            if STATUS.get("autopilot_auto_disabled_at"):
+            # the moment it auto-disables poller_enabled. v0.3.7D.1: also
+            # check the durably-persisted last_completed_run_* fields
+            # (survive a backend restart; STATUS is in-process only), but
+            # only within a recency window -- otherwise a user manually
+            # disabling the poller long after some earlier completed run
+            # would incorrectly keep reporting IDLE_AFTER_COMPLETED_RUN
+            # forever instead of IDLE_POLLER_DISABLED.
+            recently_completed = (settings_row and settings_row.last_completed_run_completed_at
+                                 and (now - settings_row.last_completed_run_completed_at).total_seconds() < 12 * 3600)
+            if STATUS.get("autopilot_auto_disabled_at") or recently_completed:
                 state_detail = "IDLE_AFTER_COMPLETED_RUN"
             else:
                 state_detail = "IDLE_POLLER_DISABLED"
+    elif in_startup_grace and (not collector_task_alive or last_tick_age_s is None):
+        status = "STARTING"
+        state_detail = "AUTOPILOT_STARTUP_GRACE"
+        reason_codes.append("STARTUP_GRACE_PERIOD_ACTIVE")
     elif not collector_task_alive:
         status = "FAIL"
         reason_codes.append("COLLECTOR_NOT_ALIVE")
@@ -222,6 +260,26 @@ def health(db: Session = Depends(get_db)):
     next_required_action = (NEXT_ACTION_BY_REASON.get(reason_codes[0])
                             if reason_codes else "No action needed -- collection healthy.")
 
+    active_run = None
+    if settings_row and settings_row.autopilot_started_at:
+        active_run = {
+            "run_started_at": settings_row.autopilot_started_at.isoformat(),
+            "configured_max_minutes": settings_row.autopilot_max_runtime_minutes,
+            "actual_runtime_minutes": round(run_age_s / 60.0, 1) if run_age_s is not None else None,
+            "in_startup_grace": in_startup_grace,
+        }
+    last_completed_run = None
+    if settings_row and settings_row.last_completed_run_completed_at:
+        started = settings_row.last_completed_run_started_at
+        completed = settings_row.last_completed_run_completed_at
+        actual_minutes = round((completed - started).total_seconds() / 60.0, 1) if started else None
+        last_completed_run = {
+            "run_started_at": started.isoformat() if started else None,
+            "run_completed_at": completed.isoformat(),
+            "configured_max_minutes": settings_row.last_completed_run_max_minutes,
+            "actual_runtime_minutes": actual_minutes,
+        }
+
     return {
         "checked_at": now.isoformat(),
         "status": status,
@@ -240,6 +298,10 @@ def health(db: Session = Depends(get_db)):
         "last_availability_heartbeat_at": last_availability_heartbeat_at,
         "snapshots_created_today": snapshots_today,
         "availability_records_created_today": availability_records_today,
+        "activity_window_kind": activity_window_kind,
+        "activity_window_start": activity_window_start.isoformat(),
+        "active_run": active_run,
+        "last_completed_run": last_completed_run,
         "median_inter_row_gap_s_live_last_6h": median_inter_row_gap_s,
         "quota": quota,
         "quota_status": quota_status,
