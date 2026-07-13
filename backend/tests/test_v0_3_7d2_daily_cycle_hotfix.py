@@ -14,6 +14,7 @@ defects found immediately after the v0.3.7D.1 merge:
    with a migration-safe, time-bounded fallback.
 """
 import importlib.util
+import json
 import subprocess
 import sys
 import tempfile
@@ -262,6 +263,14 @@ def test_daily_cycle_subprocess_against_copied_temp_database():
         combined = result.stdout + result.stderr
         assert "FAILED" not in combined, combined
         assert result.returncode == 0, combined
+
+        # v0.3.7D.3: the paper-sim step's evidence_consistency check must
+        # agree -- verdict and daily recommendation are derived from the
+        # same collection_evidence result on this real, reconciled data.
+        assert "RECOMMENDATION_EVIDENCE_MISMATCH" not in combined, combined
+        sim_json = json.loads((Path("/Users/krispatell/Downloads/ESoccer/notes/simulations")
+                              / "latest_paper_sim.json").read_text())
+        assert sim_json["evidence_consistency"]["consistent"] is True, sim_json["evidence_consistency"]
     finally:
         if original_db_bytes is not None:
             worktree_db_path.write_bytes(original_db_bytes)

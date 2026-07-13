@@ -276,7 +276,7 @@ def spot_check_section(db) -> dict:
 
 # ------------------------------------------------------------- I. deterministic verdict hierarchy (v0.3.7D.1)
 
-def verdict_hierarchy_section(db, g: dict, health: dict) -> dict:
+def verdict_hierarchy_section(db, g: dict, health: dict, evidence: dict) -> dict:
     """v0.3.7D.1 Task 7 / v0.3.7D.2 fix: the new 10-branch deterministic
     verdict, computed alongside (not replacing) the pre-existing
     `final_verdict()` legacy string verdict below -- both are reported;
@@ -287,8 +287,12 @@ def verdict_hierarchy_section(db, g: dict, health: dict) -> dict:
     only the new (D.1) Settings.last_completed_run_* bookkeeping directly --
     that bookkeeping is NULL for any run that completed under pre-D.1 code,
     which produced a false COLLECTION_NOT_RUN verdict on real, reconciled
-    data. See notes/triage/v0_3_7D2-daily-cycle-integration-fix.md."""
-    evidence = collection_evidence.resolve_collection_evidence(db, health, _now())
+    data. See notes/triage/v0_3_7D2-daily-cycle-integration-fix.md.
+
+    v0.3.7D.3: `evidence` is now resolved once by the caller and passed in,
+    so this verdict and daily_recommendation.build_recommendation() below
+    are guaranteed to reason from the identical evidence object -- see
+    notes/triage/v0_3_7D3-recommendation-consistency.md."""
     active_window = bool(health.get("expected_collection_window_active", True))
     verdict = verdict_hierarchy.determine_verdict(
         collection_has_run=evidence["collection_has_run"],
@@ -296,6 +300,7 @@ def verdict_hierarchy_section(db, g: dict, health: dict) -> dict:
         cross_tab=g["cross_tab"],
         strict_clv=g["strict_clv_by_lead_gate"]["lead_20s"],
         paired=g["paired_baseline_comparison_20s"])
+    verdict["collection_has_run"] = evidence["collection_has_run"]
     verdict["collection_run_evidence_source"] = evidence["evidence_source"]
     verdict["collection_run_evidence_detail"] = evidence["detail"]
     return verdict
@@ -354,8 +359,14 @@ def build_report(db=None) -> dict:
         g = strict_forward_section(db)
         spot = spot_check_section(db)
         verdict = final_verdict(a, b, h["status"])
-        verdict_v2 = verdict_hierarchy_section(db, g, h)
-        recommendation = daily_recommendation.build_recommendation(db, h)
+        now = _now()
+        evidence = collection_evidence.resolve_collection_evidence(db, h, now)
+        verdict_v2 = verdict_hierarchy_section(db, g, h, evidence)
+        recommendation = daily_recommendation.build_recommendation(
+            db, h, now=now, evidence=evidence, cross_tab=g["cross_tab"],
+            strict_clv=g["strict_clv_by_lead_gate"]["lead_20s"],
+            paired=g["paired_baseline_comparison_20s"])
+        evidence_consistency = daily_recommendation.check_evidence_consistency(verdict_v2, recommendation)
         return {
             "date": _now().strftime("%Y-%m-%d"), "generated_at": _now().isoformat(),
             "health_status": h["status"],
@@ -377,6 +388,7 @@ def build_report(db=None) -> dict:
             "final_verdict": verdict,
             "verdict_hierarchy": verdict_v2,
             "daily_recommendation": recommendation,
+            "evidence_consistency": evidence_consistency,
         }
     finally:
         if owns_session:
@@ -410,7 +422,10 @@ def render_markdown(r: dict) -> str:
         f"```json\n{json.dumps(r['verdict_hierarchy'], indent=2)}\n```", "",
         "## 10. Daily recommendation",
         f"**{r['daily_recommendation']['message']}**",
-        f"```json\n{json.dumps(r['daily_recommendation'], indent=2, default=str)}\n```",
+        f"```json\n{json.dumps(r['daily_recommendation'], indent=2, default=str)}\n```", "",
+        "## 11. Verdict/recommendation evidence consistency",
+        f"**{'CONSISTENT' if r['evidence_consistency']['consistent'] else r['evidence_consistency']['flag']}**",
+        f"```json\n{json.dumps(r['evidence_consistency'], indent=2, default=str)}\n```",
     ]
     return "\n".join(lines)
 
@@ -440,6 +455,9 @@ def main():
     print(f"Appended {HISTORY_CSV}")
     print(f"Final verdict: {r['final_verdict']}")
     assert r["final_verdict"] in VERDICTS
+    if not r["evidence_consistency"]["consistent"]:
+        print(f"FAIL: RECOMMENDATION_EVIDENCE_MISMATCH -- {r['evidence_consistency']}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

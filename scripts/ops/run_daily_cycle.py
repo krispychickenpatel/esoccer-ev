@@ -103,12 +103,32 @@ def main(argv: list[str] | None = None):
     print(f"    {'OK' if sim_result['returncode'] == 0 else 'FAILED'}")
 
     print("7/7 Final combined summary...")
-    all_ok = all(s.get("ok", True) for s in steps)
     date_str = _now().strftime("%Y-%m-%d")
+
+    # v0.3.7D.3: the paper-sim step's own report carries an
+    # evidence_consistency check (verdict vs. daily recommendation must
+    # agree on collection evidence -- see daily_recommendation.py). Surface
+    # any RECOMMENDATION_EVIDENCE_MISMATCH here too so the daily cycle fails
+    # closed rather than silently publishing a contradictory report.
+    evidence_consistency = None
+    sim_json_path = Path("/Users/krispatell/Downloads/ESoccer/notes/simulations") / "latest_paper_sim.json"
+    if sim_json_path.exists():
+        try:
+            evidence_consistency = json.loads(sim_json_path.read_text()).get("evidence_consistency")
+        except (json.JSONDecodeError, OSError):
+            evidence_consistency = None
+    evidence_mismatch = bool(evidence_consistency) and not evidence_consistency.get("consistent", True)
+    if evidence_mismatch:
+        steps.append({"step": "evidence_consistency", "ok": False, "output": "RECOMMENDATION_EVIDENCE_MISMATCH",
+                     "detail": evidence_consistency})
+        print(f"    RECOMMENDATION_EVIDENCE_MISMATCH: {evidence_consistency}")
+
+    all_ok = all(s.get("ok", True) for s in steps)
     summary = {
         "date": date_str, "generated_at": _now().isoformat(),
         "all_steps_ok": all_ok,
         "health_status": h["status"],
+        "evidence_consistency": evidence_consistency,
         "steps": steps,
         "report_paths": {
             "workday_md": str(STATUS_DIR / f"{date_str}-workday.md"),
