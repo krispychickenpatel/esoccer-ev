@@ -29,8 +29,8 @@ os.chdir(BACKEND_DIR)
 from sqlalchemy import select  # noqa: E402
 
 from app.database import SessionLocal  # noqa: E402
-from app.engines import (closing_records, daily_recommendation, entry_floor_diagnostics,  # noqa: E402
-                         execution_classifier_v2, market_availability,
+from app.engines import (closing_records, collection_evidence, daily_recommendation,  # noqa: E402
+                         entry_floor_diagnostics, execution_classifier_v2, market_availability,
                          paper_trade, profit_gates, spot_check_readiness,
                          strict_forward_metrics, verdict_hierarchy, winner_edge)
 from app.models import ExecutionClassification, FriendPick, PaperTrade  # noqa: E402
@@ -277,20 +277,28 @@ def spot_check_section(db) -> dict:
 # ------------------------------------------------------------- I. deterministic verdict hierarchy (v0.3.7D.1)
 
 def verdict_hierarchy_section(db, g: dict, health: dict) -> dict:
-    """v0.3.7D.1 Task 7: the new 10-branch deterministic verdict, computed
-    alongside (not replacing) the pre-existing `final_verdict()` legacy
-    string verdict below -- both are reported; this is the decisional one
-    per this release's hard rules."""
-    active_run = health.get("active_run")
-    last_completed_run = health.get("last_completed_run")
-    collection_has_run = active_run is not None or last_completed_run is not None
+    """v0.3.7D.1 Task 7 / v0.3.7D.2 fix: the new 10-branch deterministic
+    verdict, computed alongside (not replacing) the pre-existing
+    `final_verdict()` legacy string verdict below -- both are reported;
+    this is the decisional one per this release's hard rules.
+
+    v0.3.7D.2: `collection_has_run` now comes from
+    collection_evidence.resolve_collection_evidence() rather than checking
+    only the new (D.1) Settings.last_completed_run_* bookkeeping directly --
+    that bookkeeping is NULL for any run that completed under pre-D.1 code,
+    which produced a false COLLECTION_NOT_RUN verdict on real, reconciled
+    data. See notes/triage/v0_3_7D2-daily-cycle-integration-fix.md."""
+    evidence = collection_evidence.resolve_collection_evidence(db, health, _now())
     active_window = bool(health.get("expected_collection_window_active", True))
-    return verdict_hierarchy.determine_verdict(
-        collection_has_run=collection_has_run,
+    verdict = verdict_hierarchy.determine_verdict(
+        collection_has_run=evidence["collection_has_run"],
         active_collection_window=active_window,
         cross_tab=g["cross_tab"],
         strict_clv=g["strict_clv_by_lead_gate"]["lead_20s"],
         paired=g["paired_baseline_comparison_20s"])
+    verdict["collection_run_evidence_source"] = evidence["evidence_source"]
+    verdict["collection_run_evidence_detail"] = evidence["detail"]
+    return verdict
 
 
 def _gate_label(n: int) -> str:

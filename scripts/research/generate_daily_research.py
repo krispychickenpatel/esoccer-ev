@@ -110,8 +110,11 @@ def section_b_execution_learning(db) -> dict:
     # can tell "forward sample exists but is 100% non-executable" apart from
     # "forward sample exists and some of it is genuinely pre-kickoff."
     forward_rows = [r for r in rows if not r.is_historical_degraded]
+    # v0.3.7D.2: EXECUTABLE_PREKICK was renamed to EXECUTABLE_PREKICK_STRICT
+    # in v0.3.7D.1 (the no-hindsight fix) -- this reference was missed
+    # because this script isn't covered by pytest.
     forward_executable_n = sum(1 for r in forward_rows
-                               if r.executability_label == execution_classifier_v2.EXECUTABLE_PREKICK)
+                               if r.executability_label == execution_classifier_v2.EXECUTABLE_PREKICK_STRICT)
     return {"by_primary_state": result["by_primary_state"],
            "by_executability": result.get("by_executability", {}),
            "diagnostic_flag_counts": flag_counts,
