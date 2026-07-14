@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+v0.3.7D.4 launchd TEMPLATE. Rendered and installed by
+scripts/ops/install_daily_launchagent.py. Never hand-edit a copy of this
+into ~/Library/LaunchAgents; use the installer so paths/schedule are always
+consistent and validated.
+
+Deliberately carries NO EnvironmentVariables block and no secret value.
+BETSAPI_KEY/BETSAPI_TOKEN is loaded by backend/app/database.py's own
+load_dotenv() call directly from backend/.env on disk the moment the
+orchestrator script imports app.database (after chdir'ing into backend/).
+This is true regardless of what environment launchd itself provides. See
+Task 4 in notes/triage/v0_3_7D4-unattended-self-challenge.md.
+
+Note for maintainers: XML comments may never contain two consecutive
+hyphens, so this file avoids that throughout, unlike this project's usual
+prose style.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.esoccer.daily-unattended</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string><<PATH_TO_PYTHON3>></string>
+        <string><<REPO_DIR>>/scripts/ops/run_unattended_workday.py</string>
+        <string>--non-interactive</string>
+        <string>--allow-warn</string>
+        <string>--max-minutes</string>
+        <string><<MAX_MINUTES>></string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string><<REPO_DIR>></string>
+
+    <key>StandardOutPath</key>
+    <string><<REPO_DIR>>/logs/launchd/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string><<REPO_DIR>>/logs/launchd/stderr.log</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer><<HOUR>></integer>
+        <key>Minute</key>
+        <integer><<MINUTE>></integer>
+    </dict>
+
+    <!-- RunAtLoad is deliberately false: a login/reboot must never force
+         an immediate 8 hour collection; catch-up is handled by the
+         orchestrator's own schedule/spacing check (Task 6), not by launchd. -->
+    <key>RunAtLoad</key>
+    <false/>
+    <!-- KeepAlive is deliberately false: a completed daily run (exit 0 or
+         a clean non-zero status) must never be restarted by launchd. The
+         orchestrator's own lock and spacing policy are the only things that
+         decide whether a run happens, not launchd retry behavior. -->
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>

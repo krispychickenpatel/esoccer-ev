@@ -298,3 +298,63 @@ technical shorthand to actual explanations of purpose and how each page
 differs from the others (Predictions vs Best Picks was the most-asked
 confusion point -- Predictions is one signal in isolation with a scoreboard,
 Best Picks is the full decision layer combining six signals + EV + rules).
+
+## D33. KILL CRITERION for the bet365/BetsAPI pre-kickoff early-steam thesis (pre-registered 2026-07-14)
+
+**This entry is immutable.** Any future change to the criterion below
+requires a NEW dated amendment underneath it that explains why the original
+was changed -- never a silent edit of the text that follows.
+
+Decision sample at registration (v0.3.7D.4):
+- strict 20s CLV n=41, avg decimal CLV=-1.919%
+- strict 30s CLV n=35, avg decimal CLV≈-2.245%
+- strict 45s CLV n=28, avg decimal CLV≈-3.512%
+
+**Primary decision bucket: 45-second strict EXECUTABLE_PREKICK_STRICT forward CLV.**
+
+The current bet365/BetsAPI pre-kickoff early-steam thesis is rejected
+(THESIS_KILL_REVIEW_REQUIRED) only when ALL of the following are true:
+
+1. strict 45-second CLV n >= 150 unique decisional samples;
+2. average decimal CLV <= -1.0%;
+3. the 95% confidence interval upper bound is below 0;
+4. partition and cross-tab reconciliation pass (status=OK, zero
+   unrecognized rows);
+5. RESEARCH_ONLY_KICKOFF and EXECUTABLE_VIA_START_DELAY rows are excluded
+   (the strict sample already only contains EXECUTABLE_PREKICK_STRICT rows);
+6. samples use clean system timestamps (`close_polled_at`/`close_ingested_at`
+   not null) and valid closing records (`close_quality` in HIGH/MEDIUM,
+   `all_three_outcomes_present`).
+
+**Confidence interval method:** a match-clustered bootstrap (2000
+iterations, seed 1234) -- resamples MATCH IDs with replacement, not
+individual rows, because a single match can contribute more than one
+correlated selection/decision. Treating those as independent observations
+would understate the true variance. Implemented in
+`backend/app/engines/evidence_checkpoint.py::_clustered_bootstrap_ci`,
+additive to (never replacing) `strict_forward_metrics.strict_forward_clv`'s
+own unclustered per-row bootstrap.
+
+**When the kill criterion fires:**
+- do not tune the entry floor;
+- do not add model features;
+- do not automatically retrain;
+- do not promote any model;
+- output `THESIS_KILL_REVIEW_REQUIRED` prominently in the unattended status;
+- recommend either source/book evaluation or project termination;
+- require human review before another development release.
+
+**Directional recovery criterion:** if strict 45-second CLV reaches n >= 50
+and average CLV is >= 0, output `DIRECTIONAL_RECOVERY_CANDIDATE`, continue
+collection toward n=150, and do not claim a proven edge.
+
+**Negative-but-not-killed:** if strict 45-second CLV remains negative at
+n >= 50 but has not met the kill criterion, output
+`NEGATIVE_DIRECTIONAL_SIGNAL`, continue only toward the pre-registered
+n=150 decision gate, and freeze model/threshold development.
+
+None of these statuses automatically stop collection or alter the model --
+`THESIS_KILL_REVIEW_REQUIRED` and the others are surfaced prominently for
+human review, never acted on autonomously. **[Certain]** -- this is the
+gate the whole D-series of releases exists to compute correctly; changing
+it later requires a dated amendment, not a silent edit.
