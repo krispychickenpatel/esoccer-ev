@@ -21,8 +21,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent.parent / "backend"
-DB_PATH = BACKEND_DIR / "esoccer.db"
+DEFAULT_DB_PATH = BACKEND_DIR / "esoccer.db"
 DEFAULT_BACKUP_DIR = BACKEND_DIR / "backups"
+
+
+def db_path() -> Path:
+    """v0.3.7D.5: this script never went through app.database (and so never
+    honored DATABASE_URL) -- WORKDAY_DB_PATH is a dedicated override so
+    tests (and any other isolated invocation) can point backups at a
+    temporary database instead of the real backend/esoccer.db. Unset in
+    normal operation -- behavior is unchanged."""
+    override = os.environ.get("WORKDAY_DB_PATH")
+    return Path(override) if override else DEFAULT_DB_PATH
+
+
+DB_PATH = db_path()
 
 
 def backup_dir() -> Path:

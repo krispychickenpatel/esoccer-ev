@@ -29,6 +29,22 @@ orchestrator = _load("run_unattended_workday.py", "v37d4_orchestrator")
 
 
 # --------------------------------------------------- schedule / catch-up policy
+#
+# v0.3.7D.5: evaluate_schedule() now compares wall-clock time in an
+# explicit, named local timezone rather than treating naive UTC as if it
+# were also local (see notes/triage/v0_3_7D5-reliability-hotfix.md). These
+# tests pass tz=ZoneInfo("UTC") explicitly so `now`'s clock reading and the
+# "local" schedule clock are the same one, preserving each test's original
+# intent -- without that, these would silently depend on the host
+# machine's real timezone/DST offset matching the specific hour chosen in
+# each fixture, which is exactly the fragility that caused the real
+# incident. Comprehensive EST/EDT/DST-transition coverage lives in
+# test_v0_3_7d5_timezone_schedule.py.
+
+from zoneinfo import ZoneInfo  # noqa: E402
+
+_UTC = ZoneInfo("UTC")
+
 
 def _cfg(**overrides):
     base = {"scheduled_hour": 2, "scheduled_minute": 0, "catch_up_hours": 6.0,
@@ -39,7 +55,7 @@ def _cfg(**overrides):
 
 def test_proceed_when_no_prior_run_and_inside_window():
     now = datetime(2026, 7, 14, 3, 0, 0)  # 1h after the 02:00 schedule
-    decision, reason = orchestrator.evaluate_schedule(now, None, _cfg())
+    decision, reason = orchestrator.evaluate_schedule(now, None, _cfg(), tz=_UTC)
     assert decision == "PROCEED"
 
 
@@ -47,7 +63,7 @@ def test_skipped_recent_run_inside_min_spacing():
     last_end = datetime(2026, 7, 14, 10, 0, 0)
     now = last_end + timedelta(hours=5)  # well below 18h minimum spacing
     latest = {"actual_end": last_end.isoformat(), "acceptance_test": False}
-    decision, reason = orchestrator.evaluate_schedule(now, latest, _cfg())
+    decision, reason = orchestrator.evaluate_schedule(now, latest, _cfg(), tz=_UTC)
     assert decision == "SKIPPED_RECENT_RUN"
 
 
@@ -55,19 +71,19 @@ def test_acceptance_test_run_never_counts_toward_spacing():
     last_end = datetime(2026, 7, 14, 2, 5, 0)
     now = last_end + timedelta(hours=1)
     latest = {"actual_end": last_end.isoformat(), "acceptance_test": True}
-    decision, reason = orchestrator.evaluate_schedule(now, latest, _cfg())
+    decision, reason = orchestrator.evaluate_schedule(now, latest, _cfg(), tz=_UTC)
     assert decision == "PROCEED"
 
 
 def test_missed_window_outside_catchup():
     now = datetime(2026, 7, 14, 10, 0, 0)  # 8h after 02:00, catch-up is only 6h
-    decision, reason = orchestrator.evaluate_schedule(now, None, _cfg())
+    decision, reason = orchestrator.evaluate_schedule(now, None, _cfg(), tz=_UTC)
     assert decision == "MISSED_WINDOW"
 
 
 def test_catchup_inside_window():
     now = datetime(2026, 7, 14, 6, 0, 0)  # 4h after 02:00, inside the 6h catch-up
-    decision, reason = orchestrator.evaluate_schedule(now, None, _cfg())
+    decision, reason = orchestrator.evaluate_schedule(now, None, _cfg(), tz=_UTC)
     assert decision == "PROCEED"
 
 
@@ -76,12 +92,12 @@ def test_midnight_crossing_schedule_check():
     must evaluate against YESTERDAY's scheduled time, not treat midnight as
     a hard boundary that resets everything to 'no schedule yet'."""
     now = datetime(2026, 7, 14, 0, 30, 0)
-    decision, reason = orchestrator.evaluate_schedule(now, None, _cfg())
+    decision, reason = orchestrator.evaluate_schedule(now, None, _cfg(), tz=_UTC)
     # yesterday's schedule (07-13 02:00) + 6h catch-up = 07-13 08:00, long past
     assert decision == "MISSED_WINDOW"
 
     now2 = datetime(2026, 7, 14, 1, 59, 0)
-    decision2, _ = orchestrator.evaluate_schedule(now2, None, _cfg(catch_up_hours=30.0))
+    decision2, _ = orchestrator.evaluate_schedule(now2, None, _cfg(catch_up_hours=30.0), tz=_UTC)
     assert decision2 == "PROCEED"
 
 
@@ -91,7 +107,7 @@ def test_never_starts_multiple_catchup_runs_same_window():
     invocation shortly after, not another catch-up."""
     now = datetime(2026, 7, 14, 5, 0, 0)
     latest = {"actual_end": datetime(2026, 7, 14, 3, 0, 0).isoformat(), "acceptance_test": False}
-    decision, _ = orchestrator.evaluate_schedule(now, latest, _cfg())
+    decision, _ = orchestrator.evaluate_schedule(now, latest, _cfg(), tz=_UTC)
     assert decision == "SKIPPED_RECENT_RUN"
 
 
@@ -122,6 +138,86 @@ def test_db_integrity_corrupt_file(tmp_path, monkeypatch):
     monkeypatch.setattr(orchestrator, "BACKEND_DIR", tmp_path)
     ok, detail = orchestrator.check_db_integrity()
     assert ok is False
+
+
+# --------------------------------------------------- caffeinate covers the whole run
+
+class _FakeCaffeinateGuard:
+    """Records start()/stop() calls instead of spawning a real process --
+    lets the test assert ordering/coverage without touching the OS."""
+    instances = []
+
+    def __init__(self):
+        self.started = False
+        self.stopped = False
+        self.start_order = None
+        self.stop_order = None
+        _FakeCaffeinateGuard.instances.append(self)
+
+    def start(self):
+        self.started = True
+        self.start_order = len(_FakeCaffeinateGuard.calls)
+        _FakeCaffeinateGuard.calls.append(("start", self))
+
+    def stop(self):
+        self.stopped = True
+        self.stop_order = len(_FakeCaffeinateGuard.calls)
+        _FakeCaffeinateGuard.calls.append(("stop", self))
+
+    calls = []
+
+
+class _FakeSettingsRow:
+    poller_enabled = False
+
+
+class _FakeDbSession:
+    """Never touches the real database -- poller_precheck (step 6) runs
+    before db_integrity (step 4) in the code, so even a test targeting the
+    db-integrity failure path would otherwise hit the real
+    backend/esoccer.db via app.database.SessionLocal()."""
+    def get(self, model, pk):
+        return _FakeSettingsRow()
+
+    def close(self):
+        pass
+
+    def commit(self):
+        pass
+
+
+def test_caffeinate_starts_before_db_check_and_stops_on_early_failure(tmp_path, monkeypatch):
+    """Reproduces the exact gap found in the 2026-07-15/16 sleep-hang
+    incident: caffeinate must be active BEFORE the db-integrity check (one
+    of the early steps that used to run unprotected), and must still be
+    stopped (never orphaned) when that check fails and the run exits early."""
+    _FakeCaffeinateGuard.calls = []
+    _FakeCaffeinateGuard.instances = []
+    monkeypatch.setattr(orchestrator, "CaffeinateGuard", _FakeCaffeinateGuard)
+    monkeypatch.setattr(orchestrator, "LOCK_PATH", tmp_path / "run.lock")
+    monkeypatch.setattr(orchestrator, "UNATTENDED_LOG_DIR", tmp_path)
+    monkeypatch.setattr(orchestrator, "STATUS_DIR", tmp_path / "status")
+
+    import app.database as _app_database
+    monkeypatch.setattr(_app_database, "SessionLocal", lambda: _FakeDbSession())
+
+    def failing_check_db_integrity():
+        return False, "forced failure for this test"
+
+    monkeypatch.setattr(orchestrator, "check_db_integrity", failing_check_db_integrity)
+
+    rc = orchestrator.main(["--non-interactive", "--allow-warn", "--ignore-schedule"])
+
+    assert rc == 5  # DB_INTEGRITY_FAILURE exit code
+    assert len(_FakeCaffeinateGuard.instances) == 1
+    guard = _FakeCaffeinateGuard.instances[0]
+    assert guard.started is True
+    assert guard.stopped is True  # never orphaned, even on an early-exit path
+    assert guard.start_order < guard.stop_order
+    # the lock must already exist (acquired) by the time caffeinate starts,
+    # and be released by the time the process returns -- covering the WHOLE
+    # run, not just the collection phase.
+    assert not (tmp_path / "run.lock").exists()  # released in the final finally
 
 
 # --------------------------------------------------- credential check

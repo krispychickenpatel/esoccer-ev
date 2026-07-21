@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""v0.3.7D.4: fully unattended daily orchestrator.
+"""v0.3.7D.4 (v0.3.7D.5 reliability hotfix): fully unattended daily
+orchestrator.
 
     python3 scripts/ops/run_unattended_workday.py --non-interactive --allow-warn --max-minutes 480
 
@@ -14,23 +15,50 @@ promotion, no model/prediction/entry/polling-cadence changes happen here or
 anywhere this script touches. Never calls input(). Never prints a secret
 value.
 
-State machine (see notes/triage/v0_3_7D4-unattended-self-challenge.md):
-  1.  Acquire single-instance lock.
-  2.  Record run identifier and start timestamp.
+v0.3.7D.5: every invocation writes an IMMUTABLE per-run_id record under
+notes/status/unattended_runs/ -- one file per run_id, in its own directory,
+never overwritten by a different invocation. This replaces the old
+one-file-per-calendar-date scheme, where two invocations completing on the
+same UTC date silently clobbered each other's record (this is exactly what
+erased the true record of the 2026-07-15/17 sleep-hang incident --
+see notes/triage/v0_3_7D4-sleep-hang-incident.md and
+notes/triage/v0_3_7D5-reliability-hotfix.md). The record is written TWICE:
+once immediately with status_phase=STARTED (so even an abrupt kill leaves
+evidence an invocation happened), and again with the final result once
+main() completes normally. latest_unattended_run.json and the daily summary
+markdown are both derived, regenerable views over these immutable records,
+never the source of truth themselves.
+
+v0.3.7D.5: the catch-up/spacing schedule check (evaluate_schedule) now
+compares wall-clock time in an explicit, named local timezone (auto-detected
+from /etc/localtime, matching what launchd's StartCalendarInterval actually
+uses, or overridable via UNATTENDED_TIMEZONE) -- a prior version compared
+naive-UTC `now` against the configured hour as if it were also UTC.
+
+State machine (see notes/triage/v0_3_7D4-unattended-self-challenge.md,
+notes/triage/v0_3_7D4-sleep-hang-incident.md, and
+notes/triage/v0_3_7D5-reliability-hotfix.md):
+  1.  Acquire single-instance lock, then start caffeinate for the WHOLE run
+      (not just collection -- see the incident note; a scheduled 02:00 run
+      with no sleep protection before the collection phase can freeze at
+      the OS level for as long as the Mac stays asleep).
+  2.  Record run identifier and start timestamp; write the immutable
+      STARTED record immediately.
   3.  Verify repository/code version (git commit).
   4.  Verify database path and writability (+ integrity check).
   5.  Verify required credential availability without printing it.
   6.  Check whether collector/poller is already active.
   7.  Start or reuse the backend safely.
   8.  Run preflight non-interactively with WARN acceptance.
-  9.  Start the 480-minute caffeinated autopilot (wrapped in orchestrator caffeinate).
+  9.  Start the 480-minute autopilot.
   10. Wait for it to complete or fail.
   11. Confirm poller self-disabled.
   12. Run the daily cycle non-interactively.
   13. Verify backup creation.
   14. Verify workday/research/simulation/combined-summary outputs.
-  15. Write final unattended-run status (+ evidence checkpoints).
-  16. Release lock.
+  15. Write the final immutable run record (+ evidence checkpoints),
+      refresh the latest-run pointer, and regenerate that day's summary.
+  16. Stop caffeinate, release lock.
   17. Exit with a meaningful status code.
 """
 from __future__ import annotations
@@ -47,6 +75,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 REPO_DIR = Path(__file__).resolve().parent.parent.parent
 BACKEND_DIR = REPO_DIR / "backend"
@@ -55,7 +84,13 @@ sys.path.insert(0, str(REPO_DIR / "scripts" / "ops"))
 
 from unattended_lock import AlreadyRunning, UnattendedLock  # noqa: E402
 
-STATUS_DIR = Path("/Users/krispatell/Downloads/ESoccer/notes/status")
+# v0.3.7D.5: ESOCCER_NOTES_DIR overrides the notes/ base so tests (and any
+# other isolated invocation) can redirect status output to a temp directory
+# instead of the real, shared notes tree. Unset in normal operation --
+# behavior is unchanged.
+NOTES_BASE_DIR = Path(os.environ.get("ESOCCER_NOTES_DIR", "/Users/krispatell/Downloads/ESoccer/notes"))
+STATUS_DIR = NOTES_BASE_DIR / "status"
+RUN_RECORDS_DIR = STATUS_DIR / "unattended_runs"
 LOCK_PATH = REPO_DIR / "logs" / "unattended" / "run.lock"
 UNATTENDED_LOG_DIR = REPO_DIR / "logs" / "unattended"
 
@@ -248,9 +283,15 @@ def _start_backend_process() -> subprocess.Popen:
 
 class CaffeinateGuard:
     """Task 7: the orchestrator owns caffeinate coverage for the ENTIRE
-    active-collection window, independent of run_workday_autopilot.py's own
-    --caffeinate flag (which only wraps a freshly-started backend and has no
-    effect once the orchestrator has already ensured one is running)."""
+    run -- from the moment the single-instance lock is acquired until it is
+    released, not just the collection phase -- independent of
+    run_workday_autopilot.py's own --caffeinate flag (which only wraps a
+    freshly-started backend and has no effect once the orchestrator has
+    already ensured one is running). A prior version only started
+    caffeinate immediately before the autopilot phase, which left the
+    earlier lock/db/credential/backend/preflight steps unprotected; a
+    scheduled 02:00 run with an idle Mac froze at the OS level for ~44 hours
+    as a result. See notes/triage/v0_3_7D4-sleep-hang-incident.md."""
 
     def __init__(self):
         self.proc: subprocess.Popen | None = None
@@ -278,6 +319,36 @@ class CaffeinateGuard:
 
 # ------------------------------------------------------------- catch-up / spacing policy
 
+def _detect_system_timezone_name() -> str:
+    """Best-effort detection of the system's configured IANA timezone name
+    via the standard /etc/localtime symlink convention. This matters
+    because macOS launchd's StartCalendarInterval ALWAYS fires in the
+    system's local time, never UTC -- a prior version of evaluate_schedule()
+    compared naive-UTC `now` against the configured hour as if it were also
+    UTC, silently off by the local UTC offset (4-5h for US Eastern
+    depending on DST). It happened not to cause a visible failure only
+    because the offset stayed inside the catch-up buffer both times it was
+    observed live. Falls back to UTC if detection fails (non-macOS, no
+    /etc/localtime, or an unrecognized target)."""
+    try:
+        link = os.readlink("/etc/localtime")
+        marker = "zoneinfo/"
+        idx = link.find(marker)
+        if idx != -1:
+            return link[idx + len(marker):]
+    except OSError:
+        pass
+    return "UTC"
+
+
+def local_timezone() -> ZoneInfo:
+    name = os.environ.get("UNATTENDED_TIMEZONE") or _detect_system_timezone_name()
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
 def load_catchup_config() -> dict:
     def _f(name, default):
         try:
@@ -289,6 +360,7 @@ def load_catchup_config() -> dict:
         "scheduled_minute": int(_f("UNATTENDED_SCHEDULED_MINUTE", DEFAULT_SCHEDULED_MINUTE)),
         "catch_up_hours": _f("UNATTENDED_CATCHUP_HOURS", DEFAULT_CATCHUP_HOURS),
         "min_hours_between_runs": _f("UNATTENDED_MIN_HOURS_BETWEEN_RUNS", DEFAULT_MIN_HOURS_BETWEEN_RUNS),
+        "timezone_name": os.environ.get("UNATTENDED_TIMEZONE") or _detect_system_timezone_name(),
     }
 
 
@@ -299,37 +371,62 @@ def _read_json(path: Path) -> dict | None:
         return None
 
 
-def evaluate_schedule(now: datetime, latest_status: dict | None, cfg: dict) -> tuple[str, str]:
+def evaluate_schedule(now: datetime, latest_status: dict | None, cfg: dict,
+                      tz: ZoneInfo | None = None) -> tuple[str, str]:
     """Returns (decision, reason). decision is one of PROCEED,
     SKIPPED_RECENT_RUN, MISSED_WINDOW. Never uses calendar-day boundaries as
     the only evidence -- always compares against the actual completed-run
     timestamp. Acceptance-test runs never count toward spacing/catch-up
     (Task 13: a 5-minute acceptance run must not block or fake-satisfy a
-    real scheduled run)."""
+    real scheduled run).
+
+    `now` is naive UTC (this repo's own convention, e.g. _now()). All
+    "what local wall-clock hour is it" math is done in an explicit,
+    named timezone (`tz`, defaulting to cfg['timezone_name']/local_timezone()
+    -- never the machine's implicit default and never UTC-as-if-it-were-
+    local), because that is what launchd's StartCalendarInterval actually
+    uses. The catch-up window is defined in LOCAL WALL-CLOCK terms (e.g.
+    "any time before 08:00 local, even if the schedule was 02:00 local") --
+    this is what a human means by a catch-up window, and it is what
+    zoneinfo-aware datetime + timedelta arithmetic naturally computes
+    (field-wise wall-clock addition, not a fixed elapsed-seconds duration)
+    without any special-casing. Across a DST transition this means the
+    real elapsed wall-clock-to-wall-clock duration can be 1 hour more or
+    less than the nominal catch_up_hours value -- intentional, and covered
+    by tests at both the US spring-forward and fall-back boundaries."""
+    if tz is None:
+        tz = ZoneInfo(cfg["timezone_name"]) if cfg.get("timezone_name") else local_timezone()
+
+    now_utc_aware = now.replace(tzinfo=timezone.utc)
+    now_local = now_utc_aware.astimezone(tz)
+
     last_real = None
     if latest_status and not latest_status.get("acceptance_test") and latest_status.get("actual_end"):
         try:
-            last_real = datetime.fromisoformat(latest_status["actual_end"])
+            end = datetime.fromisoformat(latest_status["actual_end"])
+            last_real = end.replace(tzinfo=timezone.utc) if end.tzinfo is None else end
         except ValueError:
             last_real = None
 
     if last_real is not None:
-        hours_since = (now - last_real).total_seconds() / 3600.0
+        hours_since = (now_utc_aware - last_real).total_seconds() / 3600.0
         if hours_since < cfg["min_hours_between_runs"]:
             return "SKIPPED_RECENT_RUN", (f"last completed unattended run finished {hours_since:.1f}h ago, "
                                           f"below the {cfg['min_hours_between_runs']}h minimum spacing")
 
-    scheduled_today = now.replace(hour=cfg["scheduled_hour"], minute=cfg["scheduled_minute"],
-                                  second=0, microsecond=0)
-    if now < scheduled_today:
-        scheduled_today -= timedelta(days=1)  # still inside yesterday's catch-up window, if any
-    window_end = scheduled_today + timedelta(hours=cfg["catch_up_hours"])
+    scheduled_today_local = now_local.replace(hour=cfg["scheduled_hour"], minute=cfg["scheduled_minute"],
+                                              second=0, microsecond=0)
+    if now_local < scheduled_today_local:
+        scheduled_today_local -= timedelta(days=1)  # still inside yesterday's catch-up window, if any
+    window_end_local = scheduled_today_local + timedelta(hours=cfg["catch_up_hours"])
 
-    if now <= window_end:
-        return "PROCEED", f"inside scheduled/catch-up window (scheduled={scheduled_today.isoformat()})"
-    return "MISSED_WINDOW", (f"now={now.isoformat()} is past the catch-up window "
-                             f"(scheduled={scheduled_today.isoformat()}, "
-                             f"window_end={window_end.isoformat()})")
+    if now_local <= window_end_local:
+        return "PROCEED", (f"inside scheduled/catch-up window (scheduled={scheduled_today_local.isoformat()}, "
+                          f"tz={tz.key if hasattr(tz, 'key') else tz})")
+    return "MISSED_WINDOW", (f"now={now_local.isoformat()} is past the catch-up window "
+                             f"(scheduled={scheduled_today_local.isoformat()}, "
+                             f"window_end={window_end_local.isoformat()}, "
+                             f"tz={tz.key if hasattr(tz, 'key') else tz})")
 
 
 # ------------------------------------------------------------- subprocess helpers
@@ -411,8 +508,17 @@ def main(argv: list[str] | None = None) -> int:
         "run_id": run_id, "scheduled_hour_minute": None, "actual_start": start_ts.isoformat(),
         "actual_end": None, "acceptance_test": args.acceptance_test, "dry_run": args.dry_run,
         "commit": git_commit_hash(), "version_describe": git_describe(),
-        "steps": {}, "final_status": None,
+        "steps": {}, "final_status": None, "status_phase": "STARTED",
     }
+    # v0.3.7D.5 Task 3: write the STARTED record immediately, before doing
+    # anything else -- this is the immutable per-run_id evidence that lets a
+    # future reader tell "this invocation happened and was interrupted"
+    # apart from "this invocation never happened at all", which the old
+    # scheme could not distinguish (an abrupt kill left no record whatsoever).
+    try:
+        _write_run_record(result)
+    except OSError as e:
+        _log(f"WARN: could not write the initial STARTED record: {e}")
 
     # ---- step 1/2: schedule + lock -----------------------------------
     cfg = load_catchup_config()
@@ -440,7 +546,17 @@ def main(argv: list[str] | None = None) -> int:
         _log(f"ALREADY_RUNNING: {e.holder}")
         return 4
 
+    # v0.3.7D.4 fix (confirmed live 2026-07-16/17): caffeinate must cover the
+    # ENTIRE run from the moment the lock is held, not just the autopilot
+    # phase. A scheduled 02:00 launchd run has nothing preventing system
+    # sleep during the earlier lock/db/credential/backend/preflight steps --
+    # if the Mac goes to sleep there, the whole process freezes (blocking
+    # calls simply pause) until something else happens to wake the machine,
+    # potentially for many hours, and the missed launchd calendar interval
+    # never fires again while the frozen instance still shows as running.
+    # See notes/triage/v0_3_7D4-sleep-hang-incident.md.
     caffeinate = CaffeinateGuard()
+    caffeinate.start()
 
     def _handle_signal(signum, _frame):
         _log(f"Received signal {signum} -- shutting down safely.")
@@ -534,8 +650,10 @@ def main(argv: list[str] | None = None) -> int:
             result["pre_run_checkpoint_error"] = str(e)
 
         # ---- step 9/10: autopilot -------------------------------------------
+        # caffeinate is already running (started right after the lock was
+        # acquired, see above) -- it stays up through this AND every step
+        # after it, released only in the outermost finally below.
         max_minutes = 5 if args.acceptance_test else args.max_minutes
-        caffeinate.start()
         autopilot_timeout = max_minutes * 60 + 600  # generous margin over the configured cap
         collection_ok = True
         try:
@@ -548,8 +666,6 @@ def main(argv: list[str] | None = None) -> int:
         except subprocess.TimeoutExpired as e:
             result["steps"]["autopilot"] = {"error": "timeout", "detail": str(e)}
             collection_ok = False
-        finally:
-            caffeinate.stop()
 
         # ---- step 11: confirm poller self-disabled --------------------------
         db = SessionLocal()
@@ -625,6 +741,7 @@ def main(argv: list[str] | None = None) -> int:
         _log(f"Final status: {result['final_status']}")
         return _exit_code_for(result["final_status"])
     finally:
+        caffeinate.stop()
         lock.release()
 
 
@@ -656,18 +773,67 @@ def _exit_code_for(final_status: str) -> int:
     return 0 if final_status in ("SUCCESS", "SUCCESS_WITH_WARNINGS") else 1
 
 
-def _write_status(result: dict) -> None:
+def _run_record_path(run_id: str) -> Path:
+    return RUN_RECORDS_DIR / f"{run_id}.json"
+
+
+def _write_run_record(result: dict) -> None:
+    """v0.3.7D.5: the immutable source of truth -- one file per run_id, in
+    its own directory, never shared with or overwritten by a DIFFERENT
+    invocation (unlike the old one-file-per-calendar-date scheme, where two
+    invocations completing on the same UTC date silently clobbered each
+    other -- exactly what erased the true record of the 2026-07-15/17
+    sleep-hang incident). Safe to call more than once for the SAME run_id
+    as it progresses from status_phase=STARTED to a final result -- that is
+    still only ever this run's own file."""
+    path = _run_record_path(result["run_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, indent=2, default=str))
+
+
+def _write_daily_summary(date_str: str) -> None:
+    """Derived view, safe to regenerate from scratch every time -- scans
+    ALL immutable per-run records whose actual_start falls on `date_str`
+    (UTC) and lists every one of them (SUCCESS, FAILURE, SKIPPED,
+    interrupted -- whatever status_phase/final_status they carry), rather
+    than blindly overwriting a single file with only the latest run's
+    data."""
+    entries = []
+    if RUN_RECORDS_DIR.exists():
+        for p in RUN_RECORDS_DIR.glob("*.json"):
+            rec = _read_json(p)
+            if rec and str(rec.get("actual_start") or "").startswith(date_str):
+                entries.append(rec)
+    entries.sort(key=lambda r: r.get("actual_start") or "")
+
+    lines = [f"# Unattended Runs -- {date_str}", "",
+            f"{len(entries)} invocation(s) recorded for this date "
+            "(every SUCCESS, FAILURE, SKIPPED, MISSED, and interrupted attempt).", ""]
+    for rec in entries:
+        lines.append(f"## run_id: {rec.get('run_id')}")
+        lines.append(f"- status_phase: {rec.get('status_phase')}")
+        lines.append(f"- final_status: **{rec.get('final_status')}**")
+        lines.append(f"- acceptance_test: {rec.get('acceptance_test')}")
+        lines.append(f"- actual_start: {rec.get('actual_start')}")
+        lines.append(f"- actual_end: {rec.get('actual_end')}")
+        lines.append(f"- commit: {rec.get('commit')}")
+        lines.append("")
     STATUS_DIR.mkdir(parents=True, exist_ok=True)
-    date_str = _now().strftime("%Y-%m-%d")
+    (STATUS_DIR / f"{date_str}-unattended-runs-summary.md").write_text("\n".join(lines))
+
+
+def _write_status(result: dict) -> None:
+    """Writes the immutable per-run_id record (source of truth), refreshes
+    the latest_unattended_run.json convenience pointer (explicitly a
+    "latest" snapshot, never treated as history by anything that reads
+    it), and regenerates that day's summary from every immutable record on
+    disk. Only ever called once a final_status has been decided."""
+    STATUS_DIR.mkdir(parents=True, exist_ok=True)
+    result["status_phase"] = "COMPLETED"
+    _write_run_record(result)
     (STATUS_DIR / "latest_unattended_run.json").write_text(json.dumps(result, indent=2, default=str))
-    md_lines = [
-        f"# Unattended Run -- {date_str}", "",
-        f"run_id: {result['run_id']}", f"final_status: **{result['final_status']}**",
-        f"commit: {result.get('commit')}", f"acceptance_test: {result.get('acceptance_test')}",
-        f"actual_start: {result.get('actual_start')}", f"actual_end: {result.get('actual_end')}",
-        "", "## Full result", f"```json\n{json.dumps(result, indent=2, default=str)}\n```",
-    ]
-    (STATUS_DIR / f"{date_str}-unattended-run.md").write_text("\n".join(md_lines))
+    date_str = (result.get("actual_start") or _now().isoformat())[:10]
+    _write_daily_summary(date_str)
 
 
 if __name__ == "__main__":

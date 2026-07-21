@@ -15,9 +15,10 @@ defects found immediately after the v0.3.7D.1 merge:
 """
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
-import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -27,10 +28,27 @@ from sqlalchemy.orm import sessionmaker
 
 from app.engines import collection_evidence, verdict_hierarchy
 from app.models import Base, Match, OddsSnapshot, PaperTrade, Player, PredictionLedger, Settings
+from tests.conftest import detect_active_live_run
 
 REPO_DIR = Path(__file__).resolve().parent.parent.parent
 BACKEND_DIR = REPO_DIR / "backend"
 SCRIPTS_DIR = REPO_DIR / "scripts"
+
+# v0.3.7D.5 reliability hotfix: this smoke test used to copy a backup
+# directly onto the real backend/esoccer.db and restore it in a `finally`
+# block -- safe only as long as nothing kills the test process before that
+# restore runs, and only as long as nothing else is using that same file at
+# the same time. Neither held on 2026-07-17 (see
+# notes/triage/v0_3_7D4-sleep-hang-incident.md): the test process was
+# killed mid-run while a live 480-minute collection was active, and the
+# restore never happened. It now runs entirely inside tmp_path, redirected
+# via DATABASE_URL/WORKDAY_DB_PATH/WORKDAY_BACKUP_DIR/ESOCCER_NOTES_DIR (all
+# added by this hotfix) -- it never opens backend/esoccer.db at all. It is
+# still gated behind an explicit opt-in (defense in depth, and because it is
+# a genuinely slow ~3-4 minute real-data smoke test that shouldn't run on
+# every quick `pytest` invocation) and is still checked against the
+# conftest.py live-run guard immediately before it does anything.
+LIVE_SMOKE_TEST_ENV_VAR = "ESOCCER_LIVE_SMOKE_TEST"
 
 
 def _load(rel_path: str, name: str):
@@ -42,6 +60,36 @@ def _load(rel_path: str, name: str):
 
 
 generate_daily_research = _load("research/generate_daily_research.py", "v37d2_generate_daily_research")
+
+
+# --------------------------------------------------- v0.3.7D.5: friend-CSV-absent KeyError
+
+def test_section_f_friend_learning_absent_csv_matches_populated_branch_keys(monkeypatch):
+    """v0.3.7D.5: the FRIEND_CSV-absent branch used to return
+    {'clean', 'retro', 'groups'} while the populated branch (and
+    generate_hypotheses()'s fallback pool, which unconditionally reads
+    f['clean_count']) both use {'clean_count', 'retro_count',
+    'correlated_leg_groups'} -- a genuine pre-existing KeyError whenever
+    FRIEND_CSV is absent, first exposed by this hotfix's isolated tmp_path
+    smoke test (no such file exists there by construction)."""
+    monkeypatch.setattr(generate_daily_research, "FRIEND_CSV",
+                        generate_daily_research.NOTES_BASE_DIR / "does-not-exist.csv")
+    f = generate_daily_research.section_f_friend_learning()
+    assert f["clean_count"] == 0
+    assert f["retro_count"] == 0
+    assert f["total"] == 0
+
+    # the real regression: generate_hypotheses()'s fallback pool must not
+    # KeyError when FRIEND_CSV is absent.
+    a = {"market_availability_episodes": {"withdrawn_prevalence_pct": None,
+                                          "total_match_book_market_selection_combos_checked": 0},
+        "odds_rows_collected_today": 0, "cumulative_clean_close_count": 0}
+    b = {"by_primary_state": {}, "total_classified": 0, "forward_executable_count": 0}
+    c = {}
+    d = {"gate": "NOT ENOUGH DATA", "distinct_samples": 0}
+    e = {}
+    hyps = generate_daily_research.generate_hypotheses(a, b, c, d, e, f)
+    assert isinstance(hyps, list)
 
 
 def _db():
@@ -202,85 +250,86 @@ def test_all_time_forward_clean_n_alone_cannot_suppress_collection_not_run():
 
 # --------------------------------------------------- 7: full daily-cycle subprocess smoke test
 
-def test_daily_cycle_subprocess_against_copied_temp_database():
+def test_daily_cycle_subprocess_against_isolated_temp_database(tmp_path):
     """Runs the REAL scripts/ops/run_daily_cycle.py entrypoint end-to-end
-    against a disposable COPY of the latest verified backup -- never the
-    live database. Several of the chained scripts (backup_db.py in
-    particular) don't honor DATABASE_URL at all and always resolve
-    `<repo>/backend/esoccer.db` by cwd -- so the copy is placed there
-    (this worktree's own backend/esoccer.db, not the main repo's), and
-    restored to its original (empty placeholder) state afterward. The
-    report-writing scripts in this chain also share a few hardcoded
-    absolute output paths under notes/ -- those are snapshotted and
-    restored too, so this test can never leave a permanent side effect on
-    shared real report state. Skips gracefully if no backup exists in this
-    environment (backups/ is real, environment-specific state, not a
-    repo-tracked fixture).
+    against a disposable COPY of the latest verified backup, entirely
+    inside tmp_path -- it never opens, writes to, or migrates
+    backend/esoccer.db (real or any worktree's), and never touches the real
+    notes/ tree. Isolation is via environment variables this hotfix added
+    (DATABASE_URL, WORKDAY_DB_PATH, WORKDAY_BACKUP_DIR, ESOCCER_NOTES_DIR),
+    inherited automatically by every chained subprocess -- not a
+    snapshot-and-restore-in-place of shared real paths, which is exactly
+    what failed catastrophically last time (see the module docstring above
+    and notes/triage/v0_3_7D4-sleep-hang-incident.md).
+
+    Disabled by default -- set ESOCCER_LIVE_SMOKE_TEST=1 to run it. Even
+    then, it re-checks the conftest.py live-run guard immediately before
+    doing anything, and skips gracefully if no backup exists.
 
     Timeout is generous (10 minutes): re-classifying the full real dataset
-    (~14k MODEL paper trades) via execution_classifier_v2.classify_all()
-    and recomputing the strict-forward cross-tab/CLV waterfall over ~4.8k
-    forward rows are both pre-existing, per-row-query-heavy operations
-    (unchanged by this hotfix) -- measured at ~85s and ~110s respectively
-    against the real verified backup on this machine."""
-    import shutil
+    via execution_classifier_v2.classify_all() and recomputing the
+    strict-forward cross-tab/CLV waterfall are both pre-existing,
+    per-row-query-heavy operations (unchanged by this hotfix) -- measured
+    at ~85s and ~110s respectively against the real verified backup on this
+    machine."""
+    if not os.environ.get(LIVE_SMOKE_TEST_ENV_VAR):
+        pytest.skip(f"set {LIVE_SMOKE_TEST_ENV_VAR}=1 to run this real-data subprocess smoke test "
+                    "(disabled by default -- see notes/triage/v0_3_7D5-reliability-hotfix.md)")
 
-    live_backup_dir = REPO_DIR.parent / "esoccer-ev" / "backend" / "backups"
+    reason = detect_active_live_run()
+    if reason:
+        pytest.fail(f"refusing to run against real backup data while a live run appears active: {reason}")
+
+    live_backup_dir = BACKEND_DIR / "backups"
     candidates = sorted(live_backup_dir.glob("esoccer-*.db")) if live_backup_dir.exists() else []
     if not candidates:
         pytest.skip("no verified backup available in this environment")
     latest_backup = candidates[-1]
 
-    worktree_db_path = BACKEND_DIR / "esoccer.db"
-    worktree_backups_dir = BACKEND_DIR / "backups"
-    notes_dirs = [Path("/Users/krispatell/Downloads/ESoccer/notes/status"),
-                 Path("/Users/krispatell/Downloads/ESoccer/notes/research"),
-                 Path("/Users/krispatell/Downloads/ESoccer/notes/simulations")]
+    live_db_path = BACKEND_DIR / "esoccer.db"
+    live_db_before = (live_db_path.stat().st_mtime, live_db_path.stat().st_size) if live_db_path.exists() else None
 
-    holding = tempfile.mkdtemp(prefix="v037d2_notes_snapshot_")
-    snapshots = {}
-    for d in notes_dirs:
-        if d.exists():
-            dest = Path(holding) / d.name
-            shutil.copytree(d, dest)
-            snapshots[d] = dest
+    isolated_db = tmp_path / "esoccer.db"
+    shutil.copy2(latest_backup, isolated_db)
+    isolated_backups_dir = tmp_path / "backups"
+    isolated_backups_dir.mkdir()
+    isolated_notes_dir = tmp_path / "notes"
+    for sub in ("status", "research", "simulations", "triage"):
+        (isolated_notes_dir / sub).mkdir(parents=True)
 
-    original_db_bytes = worktree_db_path.read_bytes() if worktree_db_path.exists() else None
-    existing_backup_names = set(worktree_backups_dir.glob("*.db")) if worktree_backups_dir.exists() else set()
+    env = os.environ.copy()
+    env["DATABASE_URL"] = f"sqlite:///{isolated_db}"
+    env["WORKDAY_DB_PATH"] = str(isolated_db)
+    env["WORKDAY_BACKUP_DIR"] = str(isolated_backups_dir)
+    env["ESOCCER_NOTES_DIR"] = str(isolated_notes_dir)
 
-    try:
-        shutil.copy2(latest_backup, worktree_db_path)
+    migrate = subprocess.run(
+        [sys.executable, "-c", "from app.database import init_db; init_db()"],
+        cwd=str(BACKEND_DIR), capture_output=True, text=True, timeout=60, env=env)
+    assert migrate.returncode == 0, migrate.stdout + migrate.stderr
 
-        migrate = subprocess.run(
-            [sys.executable, "-c", "from app.database import init_db; init_db()"],
-            cwd=str(BACKEND_DIR), capture_output=True, text=True, timeout=60)
-        assert migrate.returncode == 0, migrate.stdout + migrate.stderr
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "ops" / "run_daily_cycle.py"),
+        "--non-interactive", "--allow-warn"],
+        cwd=str(REPO_DIR), capture_output=True, text=True, timeout=600, env=env)
+    combined = result.stdout + result.stderr
+    assert "FAILED" not in combined, combined
+    assert result.returncode == 0, combined
 
-        result = subprocess.run(
-            [sys.executable, str(SCRIPTS_DIR / "ops" / "run_daily_cycle.py"),
-            "--non-interactive", "--allow-warn"],
-            cwd=str(REPO_DIR), capture_output=True, text=True, timeout=600)
-        combined = result.stdout + result.stderr
-        assert "FAILED" not in combined, combined
-        assert result.returncode == 0, combined
+    # v0.3.7D.3: the paper-sim step's evidence_consistency check must
+    # agree -- verdict and daily recommendation are derived from the
+    # same collection_evidence result on this real, reconciled data.
+    assert "RECOMMENDATION_EVIDENCE_MISMATCH" not in combined, combined
+    sim_json = json.loads((isolated_notes_dir / "simulations" / "latest_paper_sim.json").read_text())
+    assert sim_json["evidence_consistency"]["consistent"] is True, sim_json["evidence_consistency"]
 
-        # v0.3.7D.3: the paper-sim step's evidence_consistency check must
-        # agree -- verdict and daily recommendation are derived from the
-        # same collection_evidence result on this real, reconciled data.
-        assert "RECOMMENDATION_EVIDENCE_MISMATCH" not in combined, combined
-        sim_json = json.loads((Path("/Users/krispatell/Downloads/ESoccer/notes/simulations")
-                              / "latest_paper_sim.json").read_text())
-        assert sim_json["evidence_consistency"]["consistent"] is True, sim_json["evidence_consistency"]
-    finally:
-        if original_db_bytes is not None:
-            worktree_db_path.write_bytes(original_db_bytes)
-        elif worktree_db_path.exists():
-            worktree_db_path.unlink()
-        if worktree_backups_dir.exists():
-            for p in worktree_backups_dir.glob("*.db"):
-                if p not in existing_backup_names:
-                    p.unlink()
-        for d, snap in snapshots.items():
-            shutil.rmtree(d)
-            shutil.copytree(snap, d)
-        shutil.rmtree(holding, ignore_errors=True)
+    # Prove isolation actually held -- the real production db was never
+    # touched, byte for byte.
+    live_db_after = (live_db_path.stat().st_mtime, live_db_path.stat().st_size) if live_db_path.exists() else None
+    assert live_db_before == live_db_after, (
+        "the live backend/esoccer.db changed during this test -- isolation failed")
+
+
+def test_live_smoke_test_is_skipped_by_default(monkeypatch):
+    monkeypatch.delenv(LIVE_SMOKE_TEST_ENV_VAR, raising=False)
+    assert os.environ.get(LIVE_SMOKE_TEST_ENV_VAR) is None

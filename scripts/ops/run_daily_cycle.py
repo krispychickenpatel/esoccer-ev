@@ -27,7 +27,15 @@ BACKEND_DIR = REPO_DIR / "backend"
 sys.path.insert(0, str(BACKEND_DIR))
 os.chdir(BACKEND_DIR)
 
-STATUS_DIR = Path("/Users/krispatell/Downloads/ESoccer/notes/status")
+# v0.3.7D.5: ESOCCER_NOTES_DIR overrides the notes/ base so tests (and any
+# other isolated invocation) can redirect report output to a temp directory
+# instead of the real, shared notes tree. Unset in normal operation --
+# behavior is unchanged. Child scripts invoked via subprocess below inherit
+# this (and DATABASE_URL, WORKDAY_BACKUP_DIR, WORKDAY_DB_PATH) from the
+# environment automatically -- subprocess.run() inherits the parent env by
+# default.
+NOTES_BASE_DIR = Path(os.environ.get("ESOCCER_NOTES_DIR", "/Users/krispatell/Downloads/ESoccer/notes"))
+STATUS_DIR = NOTES_BASE_DIR / "status"
 
 # v0.3.7D.1 Task 9: this script never called input() to begin with -- these
 # flags exist for a consistent contract across all three ops scripts.
@@ -111,7 +119,7 @@ def main(argv: list[str] | None = None):
     # any RECOMMENDATION_EVIDENCE_MISMATCH here too so the daily cycle fails
     # closed rather than silently publishing a contradictory report.
     evidence_consistency = None
-    sim_json_path = Path("/Users/krispatell/Downloads/ESoccer/notes/simulations") / "latest_paper_sim.json"
+    sim_json_path = NOTES_BASE_DIR / "simulations" / "latest_paper_sim.json"
     if sim_json_path.exists():
         try:
             evidence_consistency = json.loads(sim_json_path.read_text()).get("evidence_consistency")
@@ -132,10 +140,8 @@ def main(argv: list[str] | None = None):
         "steps": steps,
         "report_paths": {
             "workday_md": str(STATUS_DIR / f"{date_str}-workday.md"),
-            "research_md": str(Path("/Users/krispatell/Downloads/ESoccer/notes/research") /
-                              f"{date_str}-daily-research.md"),
-            "paper_sim_md": str(Path("/Users/krispatell/Downloads/ESoccer/notes/simulations") /
-                              f"{date_str}-paper-sim.md"),
+            "research_md": str(NOTES_BASE_DIR / "research" / f"{date_str}-daily-research.md"),
+            "paper_sim_md": str(NOTES_BASE_DIR / "simulations" / f"{date_str}-paper-sim.md"),
         },
     }
 

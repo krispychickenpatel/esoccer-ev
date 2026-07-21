@@ -27,7 +27,12 @@ from app.models import (ClosingRecord, ExecutionClassification, FriendPick,  # n
                         RawProviderResponse)
 from app.routers.ops import health  # noqa: E402
 
-STATUS_DIR = Path("/Users/krispatell/Downloads/ESoccer/notes/status")
+# v0.3.7D.5: ESOCCER_NOTES_DIR overrides the notes/ base so tests (and any
+# other isolated invocation) can redirect report output to a temp directory
+# instead of the real, shared notes tree. Unset in normal operation --
+# behavior is unchanged.
+NOTES_BASE_DIR = Path(os.environ.get("ESOCCER_NOTES_DIR", "/Users/krispatell/Downloads/ESoccer/notes"))
+STATUS_DIR = NOTES_BASE_DIR / "status"
 
 
 def _fetch_health(db, timeout_s: float = 2.0) -> dict:
@@ -47,8 +52,8 @@ def _fetch_health(db, timeout_s: float = 2.0) -> dict:
     except Exception:
         pass
     return health(db=db)
-FRIEND_CSV = Path("/Users/krispatell/Downloads/ESoccer/notes/friend_picks.csv")
-SPOT_CHECK_CSV = Path("/Users/krispatell/Downloads/ESoccer/notes/triage/book_spot_checks.csv")
+FRIEND_CSV = NOTES_BASE_DIR / "friend_picks.csv"
+SPOT_CHECK_CSV = NOTES_BASE_DIR / "triage" / "book_spot_checks.csv"
 BACKUP_DIR = BACKEND_DIR / "backups"
 
 

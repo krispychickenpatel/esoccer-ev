@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""v0.3.7D.4 Task 9/11: one-command unattended-operations status.
+"""v0.3.7D.4 Task 9/11 (v0.3.7D.5 reliability hotfix): one-command
+unattended-operations status.
 
     python3 scripts/ops/daily_launchagent_status.py
 
@@ -9,6 +10,7 @@ than `launchctl print` (to check load state).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -16,11 +18,26 @@ from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent.parent.parent
 BACKEND_DIR = REPO_DIR / "backend"
-STATUS_DIR = Path("/Users/krispatell/Downloads/ESoccer/notes/status")
+sys.path.insert(0, str(REPO_DIR / "scripts" / "ops"))
+
+from run_unattended_workday import local_timezone  # noqa: E402 -- reuse, don't duplicate
+
+# v0.3.7D.5: ESOCCER_NOTES_DIR overrides the notes/ base so tests (and any
+# other isolated invocation) can redirect status reads to a temp directory
+# instead of the real, shared notes tree. Unset in normal operation --
+# behavior is unchanged.
+NOTES_BASE_DIR = Path(os.environ.get("ESOCCER_NOTES_DIR", "/Users/krispatell/Downloads/ESoccer/notes"))
+STATUS_DIR = NOTES_BASE_DIR / "status"
+RUN_RECORDS_DIR = STATUS_DIR / "unattended_runs"
 LABEL = "com.esoccer.daily-unattended"
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 INSTALLED_PLIST_PATH = LAUNCH_AGENTS_DIR / f"{LABEL}.plist"
 CONFIG_MARKER_PATH = REPO_DIR / "logs" / "unattended" / "launchagent_config.json"
+
+# v0.3.7D.5: a STARTED record older than this with no final status is
+# treated as interrupted (killed/crashed) rather than "still running" --
+# generous margin over the 480-minute collection cap + daily-cycle time.
+DEFAULT_MAX_REASONABLE_RUN_HOURS = 10.0
 
 
 def _now():
@@ -55,12 +72,42 @@ def _backend_health() -> dict | None:
     return None
 
 
-def _next_scheduled(cfg: dict) -> str:
-    now = _now()
-    sched = now.replace(hour=cfg.get("hour", 2), minute=cfg.get("minute", 0), second=0, microsecond=0)
-    if sched <= now:
-        sched += timedelta(days=1)
-    return sched.isoformat()
+def _next_scheduled(cfg: dict, now: datetime | None = None, tz=None) -> str:
+    """v0.3.7D.5: computed in the SAME explicit local timezone
+    evaluate_schedule() uses (matching launchd's own StartCalendarInterval
+    semantics), not naive UTC treated as if it were local."""
+    now = now or _now()
+    tz = tz or local_timezone()
+    now_local = now.replace(tzinfo=timezone.utc).astimezone(tz)
+    sched_local = now_local.replace(hour=cfg.get("hour", 2), minute=cfg.get("minute", 0),
+                                    second=0, microsecond=0)
+    if sched_local <= now_local:
+        sched_local += timedelta(days=1)
+    return sched_local.isoformat()
+
+
+def scan_interrupted_runs(records_dir: Path, now: datetime,
+                          max_reasonable_hours: float = DEFAULT_MAX_REASONABLE_RUN_HOURS) -> list[dict]:
+    """v0.3.7D.5 Task 3: a record whose status_phase is still STARTED well
+    past any reasonable run duration never reached a final status -- the
+    process was killed or crashed. Never fabricates an end time or a
+    final_status; just flags it with how long it's been."""
+    interrupted = []
+    if not records_dir.exists():
+        return interrupted
+    for p in sorted(records_dir.glob("*.json")):
+        rec = _read_json(p)
+        if not rec or rec.get("status_phase") != "STARTED":
+            continue
+        try:
+            start = datetime.fromisoformat(rec["actual_start"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        age_hours = (now - start).total_seconds() / 3600.0
+        if age_hours > max_reasonable_hours:
+            interrupted.append({"run_id": rec.get("run_id"), "actual_start": rec.get("actual_start"),
+                               "age_hours": round(age_hours, 1)})
+    return interrupted
 
 
 def build_status() -> dict:
@@ -71,27 +118,30 @@ def build_status() -> dict:
     checkpoint_store = _read_json(STATUS_DIR / "latest_evidence_checkpoint.json") or {}
     latest_checkpoint = checkpoint_store.get("latest")
     health = _backend_health()
+    now = _now()
+    interrupted_runs = scan_interrupted_runs(RUN_RECORDS_DIR, now)
 
     backups_dir = BACKEND_DIR / "backups"
     backups = sorted(backups_dir.glob("esoccer-*.db"), key=lambda p: p.stat().st_mtime, reverse=True) \
         if backups_dir.exists() else []
-    last_backup_age_h = (round((_now() - _utcfromtimestamp(backups[0].stat().st_mtime)).total_seconds() / 3600, 1)
+    last_backup_age_h = (round((now - _utcfromtimestamp(backups[0].stat().st_mtime)).total_seconds() / 3600, 1)
                         if backups else None)
 
     daily_cycle_path = STATUS_DIR / "latest_daily_cycle.json"
-    last_report_age_h = (round((_now() - _utcfromtimestamp(daily_cycle_path.stat().st_mtime)).total_seconds() / 3600, 1)
+    last_report_age_h = (round((now - _utcfromtimestamp(daily_cycle_path.stat().st_mtime)).total_seconds() / 3600, 1)
                         if daily_cycle_path.exists() else None)
 
     strict_45 = (latest_checkpoint or {}).get("lead_gates", {}).get("45s", {})
 
     return {
-        "checked_at": _now().isoformat(),
+        "checked_at": now.isoformat(),
         "launchagent_installed": installed,
         "launchagent_loaded": loaded,
-        "next_scheduled_run": _next_scheduled(cfg) if cfg else None,
+        "next_scheduled_run": _next_scheduled(cfg, now) if cfg else None,
         "config": cfg,
         "last_unattended_run": {
             "run_id": (last_run or {}).get("run_id"),
+            "status_phase": (last_run or {}).get("status_phase"),
             "final_status": (last_run or {}).get("final_status"),
             "actual_end": (last_run or {}).get("actual_end"),
             "acceptance_test": (last_run or {}).get("acceptance_test"),
@@ -101,6 +151,7 @@ def build_status() -> dict:
                                         if isinstance(last_run, dict) and last_run.get("bottleneck_classification") else None,
             "strict_sample_stalled": (last_run or {}).get("strict_sample_stalled"),
         },
+        "interrupted_runs": interrupted_runs,
         "collector_active": bool(health and health.get("poller_enabled_in_settings")),
         "backend_health_status": (health or {}).get("status", "UNREACHABLE"),
         "last_backup_age_hours": last_backup_age_h,

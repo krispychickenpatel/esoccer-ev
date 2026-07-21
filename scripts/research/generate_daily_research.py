@@ -32,7 +32,12 @@ from app.engines import (clv_forward_readiness, entry_floor_diagnostics,  # noqa
 from app.models import (ClosingRecord, ExecutionClassification, FriendPick,  # noqa: E402
                         OddsSnapshot, PaperTrade, PredictionLedger)
 
-RESEARCH_DIR = Path("/Users/krispatell/Downloads/ESoccer/notes/research")
+# v0.3.7D.5: ESOCCER_NOTES_DIR overrides the notes/ base so tests (and any
+# other isolated invocation) can redirect report output to a temp directory
+# instead of the real, shared notes tree. Unset in normal operation --
+# behavior is unchanged.
+NOTES_BASE_DIR = Path(os.environ.get("ESOCCER_NOTES_DIR", "/Users/krispatell/Downloads/ESoccer/notes"))
+RESEARCH_DIR = NOTES_BASE_DIR / "research"
 
 
 def _fetch_health(db, timeout_s: float = 2.0) -> dict:
@@ -49,7 +54,7 @@ def _fetch_health(db, timeout_s: float = 2.0) -> dict:
         pass
     from app.routers.ops import health
     return health(db=db)
-FRIEND_CSV = Path("/Users/krispatell/Downloads/ESoccer/notes/friend_picks.csv")
+FRIEND_CSV = NOTES_BASE_DIR / "friend_picks.csv"
 BACKLOG_MD = RESEARCH_DIR / "experiment_backlog.md"
 
 DIRECTIONAL_MIN_N = 50
@@ -212,8 +217,18 @@ def section_e_steam_learning(db) -> dict:
 # --------------------------------------------------------------- section F
 
 def section_f_friend_learning() -> dict:
+    # v0.3.7D.5: this branch's keys previously didn't match the populated
+    # branch below (clean/retro/groups vs. clean_count/retro_count/
+    # correlated_leg_groups) -- generate_hypotheses()'s fallback pool always
+    # reads f['clean_count'], so this branch has always raised KeyError
+    # whenever FRIEND_CSV is genuinely absent. Never triggered in
+    # production (a real friend_picks.csv always exists there) or in the
+    # prior version of the D.2 smoke test (which ran against a location
+    # that also always had one) -- first exposed by this hotfix's isolated
+    # tmp_path smoke test, which has no such file by construction.
     if not FRIEND_CSV.exists():
-        return {"total": 0, "clean": 0, "retro": 0, "groups": {}}
+        return {"total": 0, "clean_count": 0, "retro_count": 0, "correlated_leg_groups": {},
+               "retro_excluded_from_clean_sample": True}
     with open(FRIEND_CSV) as f:
         rows = list(csv.DictReader(f))
     clean = [r for r in rows if r.get("clean_scored") == "TRUE"]

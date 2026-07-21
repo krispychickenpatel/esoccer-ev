@@ -35,7 +35,12 @@ from app.engines import (closing_records, collection_evidence, daily_recommendat
                          strict_forward_metrics, verdict_hierarchy, winner_edge)
 from app.models import ExecutionClassification, FriendPick, PaperTrade  # noqa: E402
 
-SIM_DIR = Path("/Users/krispatell/Downloads/ESoccer/notes/simulations")
+# v0.3.7D.5: ESOCCER_NOTES_DIR overrides the notes/ base so tests (and any
+# other isolated invocation) can redirect report output to a temp directory
+# instead of the real, shared notes tree. Unset in normal operation --
+# behavior is unchanged.
+NOTES_BASE_DIR = Path(os.environ.get("ESOCCER_NOTES_DIR", "/Users/krispatell/Downloads/ESoccer/notes"))
+SIM_DIR = NOTES_BASE_DIR / "simulations"
 
 
 def _fetch_health(db, timeout_s: float = 2.0) -> dict:
@@ -55,7 +60,7 @@ def _fetch_health(db, timeout_s: float = 2.0) -> dict:
 
 
 HISTORY_CSV = SIM_DIR / "simulation_history.csv"
-FRIEND_CSV = Path("/Users/krispatell/Downloads/ESoccer/notes/friend_picks.csv")
+FRIEND_CSV = NOTES_BASE_DIR / "friend_picks.csv"
 
 N_NOT_ENOUGH = 50
 N_DIRECTIONAL = 50
